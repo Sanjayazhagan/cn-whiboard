@@ -1,0 +1,3 @@
+pillow        # optional: PNG export and JPEG/BMP images
+cryptography  # recommended: lets the server create its TLS certificate (otherwise the openssl tool is used)
+pyinstaller   # only for building the .exe / Linux binaries
