@@ -1324,9 +1324,15 @@ class App(tk.Tk):
             elif not self.offline:
                 self.start_reconnect()
 
+    @staticmethod
+    def cursor_tag(user):
+        # Tk splits a tag on spaces, so "cur_Sanjay (web)" never matched canvas.delete() and every
+        # cursor move left a dot behind; hex keeps the tag one word and still unique per user
+        return "cur_" + user.encode().hex()
+
     def draw_cursor(self, m):
         col = next((u["color"] for u in self.users if u["name"] == m["user"]), "#444")
-        tag = "cur_" + m["user"]
+        tag = self.cursor_tag(m["user"])
         self.canvas.delete(tag)
         x, y = m["x"], m["y"]
         self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=col, outline="", tags=tag)
@@ -1343,7 +1349,7 @@ class App(tk.Tk):
             self.plist.insert("end", f"{'●' if u['online'] else '○'} {u['name']} {('('+tags.strip()+')') if tags.strip() else ''}{lat}")
             self.plist.itemconfig(i, fg=u["color"])
             if not u["online"]:
-                self.canvas.delete("cur_" + u["name"])
+                self.canvas.delete(self.cursor_tag(u["name"]))
             if u["name"] == keep:
                 self.plist.selection_set(i)
 
