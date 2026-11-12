@@ -265,7 +265,7 @@ Build on each target OS; PyInstaller does not cross-compile.
 
 **Ready-made downloads:** the GitHub Actions workflow `.github/workflows/build.yml` builds both executables on Windows
 and on Linux (Ubuntu 22.04), checks that the server answers `diagnose.py` and that the client starts, and runs every test
-file on both systems. Pushing a tag such as `v1.0` attaches the files to a GitHub Release (see the Releases page).
+file on both systems. Pushing a tag such as `v1.0`, or running the workflow by hand (Actions tab -> Build executables -> Run workflow) with a release tag, attaches the files to a GitHub Release (see the Releases page).
 - Windows: `whiteboard-server.exe`, `whiteboard-client.exe`. The files are not code-signed, so SmartScreen may say
   "Windows protected your PC": click *More info* -> *Run anyway*. On the first server start, allow it through the
   firewall on *Private networks*, or other PCs cannot connect.

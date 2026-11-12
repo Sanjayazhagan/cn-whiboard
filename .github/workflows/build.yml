@@ -1,7 +1,8 @@
 # Builds the whiteboard executables for Windows and Linux with PyInstaller, smoke-tests them,
 # and runs the test suite on both systems.
 #   - every push / pull request: binaries are uploaded as workflow artifacts (Actions tab -> run -> Artifacts)
-#   - pushing a tag like v1.0: the binaries are also attached to a GitHub Release (Releases page)
+#   - pushing a tag like v1.0, or running the workflow by hand with a release_tag: the binaries are also
+#     attached to a GitHub Release (Releases page)
 name: Build executables
 
 on:
@@ -10,6 +11,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a GitHub Release with this tag (e.g. v1.0); leave empty to only build"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -113,7 +119,7 @@ jobs:
           echo "All tests passed"
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -123,12 +129,13 @@ jobs:
       - name: Zip and publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           cd art
           chmod +x whiteboard-linux/whiteboard-server whiteboard-linux/whiteboard-client
           (cd whiteboard-windows && zip -q ../whiteboard-windows.zip *)
           tar -czf whiteboard-linux.tar.gz -C whiteboard-linux .
           cp whiteboard-windows/whiteboard-server.exe whiteboard-windows/whiteboard-client.exe .
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Whiteboard $GITHUB_REF_NAME" \
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Whiteboard $TAG" \
             --notes "Windows: download whiteboard-windows.zip (or the two .exe files). Linux: whiteboard-linux.tar.gz, then chmod +x. See README for how to run." \
             whiteboard-windows.zip whiteboard-linux.tar.gz whiteboard-server.exe whiteboard-client.exe
