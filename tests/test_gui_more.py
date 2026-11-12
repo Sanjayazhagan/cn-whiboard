@@ -86,10 +86,15 @@ try:
     first_enc = min(n for (n, _t, d, m, *_r) in a.net.trace if d == "tx" and m.get("type") == "ADD"
                     and m["obj"]["kind"] == "enc")
     assert not [n for n in live_after if n > first_enc - 30 and n > first_enc - 1]      # no live preview leaks
-    time.sleep(0.5)
-    db_text = open(os.path.join(tmp, "t.db"), "rb").read() + (open(os.path.join(tmp, "t.db-wal"), "rb").read()
+    def db_bytes():
+        return open(os.path.join(tmp, "t.db"), "rb").read() + (open(os.path.join(tmp, "t.db-wal"), "rb").read()
                                                                if os.path.exists(os.path.join(tmp, "t.db-wal")) else b"")
-    assert b"SECRET MEETING" not in db_text and b"tiger" not in db_text and b'"kind":"enc"' in db_text
+    t_end = time.time() + 5                     # the server's write can take a moment (seen on Windows CI)
+    while b'"kind":"enc"' not in db_bytes() and time.time() < t_end:
+        time.sleep(0.2)
+    db_text = db_bytes()
+    assert b'"kind":"enc"' in db_text, "encrypted object never reached the database"
+    assert b"SECRET MEETING" not in db_text and b"tiger" not in db_text, "plaintext found in the database"
     b.set_e2e("wrong-key"); assert items(b) == 1 and len(b.sealed) == 2
     b.set_e2e("river-42"); spin(a, b, secs=0.3)
     assert items(b) == 3 and not b.sealed and b.objs[[i for i in b.objs][-1]]["obj"]["text"] == "SECRET MEETING 5PM"
