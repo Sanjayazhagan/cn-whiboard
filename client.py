@@ -5,7 +5,7 @@ sends PING; the Tk main thread polls the queue (Tkinter is not thread-safe, so
 sockets never touch widgets directly). LAN discovery runs in its own short-lived
 thread and reports back through the same queue.
 
-Reliability: requests that change the board (ADD, ERASE, UNDO, REDO, CLEAR) and chat
+Reliability: requests that change the board (ADD, ERASE, MOVE, UNDO, REDO, CLEAR) and chat
 carry a msg_id and stay in an "outbox" until the server ACKs them. After a reconnect
 everything still in the outbox is sent again; the server ignores ids it has already
 processed, so nothing is lost and nothing is applied twice.
@@ -278,6 +278,8 @@ class App(tk.Tk):
         self.photos, self.hist = {}, None   # image cache (Tk drops unreferenced images), history window
         self.tool, self.color, self.width = "pen", "#000000", 3
         self.cur, self.cur_pts, self.last_live, self.last_cursor = None, [], 0, 0
+        self.drag = None          # select tool: {"id", "x0", "y0", "dx", "dy"} while an object is being dragged
+        self.moves = {}           # msg_id of my MOVE -> ids, redrawn from the server's state once ACKed
 
     # ------------------------------------------------------------ login screen
     def build_login(self):
@@ -509,9 +511,9 @@ class App(tk.Tk):
         bar = ttk.Frame(self)
         bar.pack(side="top", fill="x")
         self.tool_var = tk.StringVar(self, value="pen")
-        for t in ("pen", "eraser", "line", "rect", "oval", "text", "sticky", "image", "laser"):
+        for t in ("select", "pen", "eraser", "line", "rect", "oval", "text", "sticky", "image", "laser"):
             ttk.Radiobutton(bar, text=t.title(), value=t, variable=self.tool_var,
-                            command=lambda: setattr(self, "tool", self.tool_var.get())).pack(side="left", padx=2)
+                            command=self.set_tool).pack(side="left", padx=2)
         self.color_btn = tk.Button(bar, text="  Color  ", bg=self.color, fg="white", command=self.pick_color)
         self.color_btn.pack(side="left", padx=6)
         self.width_var = tk.IntVar(self, value=3)
@@ -808,6 +810,11 @@ class App(tk.Tk):
                 self.hist_list.insert("end", f"{v['ts']}  {v['label']}  ({v['count']} objects)")
 
     # ------------------------------------------------------------ drawing input
+    def set_tool(self):
+        self.tool = self.tool_var.get()
+        self.canvas.config(cursor="fleur" if self.tool == "select" else "")
+        self.canvas.delete("sel")
+
     def can_draw(self):
         return self.role == "editor" and not self.offline
 
@@ -830,6 +837,8 @@ class App(tk.Tk):
             return self.laser_at(e.x, e.y)
         if not self.can_draw():
             return
+        if self.tool == "select":
+            return self.select_at(e)
         self.cur_pts = [[e.x, e.y]]
         if self.tool == "text":
             s = simpledialog.askstring("Text", "Enter text:", parent=self)
@@ -851,6 +860,9 @@ class App(tk.Tk):
                 self.last_live = time.time()
                 self.laser_at(e.x, e.y)
             return
+        if self.tool == "select" and self.drag:
+            self.on_move(e)
+            return self.drag_to(e)
         if not self.can_draw() or not self.cur_pts:
             return
         self.on_move(e)
@@ -874,6 +886,8 @@ class App(tk.Tk):
             self.cur_pts = [self.cur_pts[0], [e.x, e.y]]
 
     def on_release(self, e):
+        if self.tool == "select" and self.drag:
+            return self.drop()
         if not self.can_draw() or not self.cur_pts:
             return
         if self.tool == "pen":
@@ -890,6 +904,61 @@ class App(tk.Tk):
         if text is not None:
             obj["text"] = text
         self.send_reliable({"type": "ADD", "obj": obj})
+
+    # ---- select tool: click an object, drag it, release -> one MOVE request (synced to everyone)
+    def object_at(self, x, y, r=4):
+        """Id of the topmost visible object under (x, y), or None."""
+        for item in reversed(self.canvas.find_overlapping(x - r, y - r, x + r, y + r)):
+            if self.canvas.itemcget(item, "state") == "hidden":
+                continue
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("o_") and tag[2:] in self.objs and self.objs[tag[2:]]["visible"]:
+                    return tag[2:]
+        return None
+
+    def select_at(self, e):
+        oid = self.object_at(e.x, e.y)
+        self.canvas.delete("sel")
+        if oid is None:
+            self.drag = None
+            return
+        self.drag = {"id": oid, "x0": e.x, "y0": e.y, "dx": 0, "dy": 0}
+        self.show_selection(oid)
+
+    def show_selection(self, oid):
+        self.canvas.delete("sel")
+        box = self.canvas.bbox("o_" + oid)
+        if box:
+            x0, y0, x1, y1 = box
+            self.canvas.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline="#1e88e5", dash=(4, 3),
+                                         width=1, tags="sel")
+
+    def drag_to(self, e):
+        d = self.drag
+        ddx, ddy = e.x - d["x0"] - d["dx"], e.y - d["y0"] - d["dy"]
+        if ddx or ddy:
+            self.canvas.move("o_" + d["id"], ddx, ddy)       # local preview; nothing is sent until release
+            self.canvas.move("sel", ddx, ddy)
+            d["dx"] += ddx
+            d["dy"] += ddy
+
+    def drop(self):
+        d, self.drag = self.drag, None
+        self.canvas.delete("sel")
+        if d["dx"] or d["dy"]:
+            msg = {"type": "MOVE", "ids": [d["id"]], "dx": d["dx"], "dy": d["dy"]}
+            self.send_reliable(msg)
+            self.moves[msg["msg_id"]] = [d["id"]]
+
+    def shift_obj(self, oid, dx, dy):
+        """Apply a MOVE to my copy of one object (also to its sealed form, so it lands right once decrypted)."""
+        if oid in self.objs:
+            o = self.objs[oid]["obj"]
+            o = self.objs[oid]["obj"] = {**o, "points": [[x + dx, y + dy] for x, y in o["points"]]}
+            self.draw_obj(o, self.objs[oid]["visible"])
+        if oid in self.sealed:
+            o = self.sealed[oid]
+            self.sealed[oid] = {**o, "points": [[x + dx, y + dy] for x, y in o["points"]]}
 
     def erase_at(self, e):
         r = 5 + self.width
@@ -976,6 +1045,12 @@ class App(tk.Tk):
                 self.draw_pending()                 # the ones still waiting for their turn stay visible
             if op.get("by") in self.live:
                 self.canvas.delete(self.live.pop(op["by"]))
+        elif op["op"] == "MOVE":
+            for i in op["ids"]:
+                if self.drag and self.drag["id"] == i and op.get("by") != self.me:
+                    self.drag = None                    # someone else moved it under my mouse: theirs wins
+                    self.canvas.delete("sel")
+                self.shift_obj(i, op["dx"], op["dy"])
         else:
             for i in op["ids"]:
                 if i in self.objs:
@@ -1082,6 +1157,9 @@ class App(tk.Tk):
                     self.show_auth()
                 messagebox.showerror("Cannot join", m["text"])
         elif t == "ACK":
+            for oid in self.moves.pop(m.get("msg_id"), []):     # my drag preview -> the server's position
+                if oid in self.objs:                             # (corrects it if the move was refused)
+                    self.draw_obj(self.objs[oid]["obj"], self.objs[oid]["visible"])
             if self.outbox.pop(m.get("msg_id"), None) is not None:
                 self.acked += 1
                 self.sent_at, self.rto_tries = time.time(), 0      # progress: restart the retransmit timer
@@ -1514,7 +1592,9 @@ class App(tk.Tk):
     def summarize(m):
         t = m.get("type")
         if t == "OP":
-            what = m["obj"]["kind"] if m.get("op") == "ADD" else f"{len(m.get('ids', []))} ids -> {'show' if m.get('visible') else 'hide'}"
+            what = m["obj"]["kind"] if m.get("op") == "ADD" else \
+                f"{len(m.get('ids', []))} ids by ({m.get('dx')}, {m.get('dy')})" if m.get("op") == "MOVE" else \
+                f"{len(m.get('ids', []))} ids -> {'show' if m.get('visible') else 'hide'}"
             return f"seq={m.get('seq')} {m.get('op')} {what} by {m.get('by')}"
         if t == "ADD":
             return f"rn={m.get('rn')} {m['obj'].get('kind')} {len(m['obj'].get('points', []))} pts"
@@ -1709,6 +1789,9 @@ class App(tk.Tk):
                 self.make_item(o["kind"], o["points"], o["color"], o["width"],
                                o.get("data") if o["kind"] == "image" else o.get("text"),
                                ("obj", "o_" + o["id"]), canvas=c)
+            elif op["op"] == "MOVE":
+                for i in op["ids"]:
+                    c.move("o_" + i, op["dx"], op["dy"])
             else:
                 for i in op["ids"]:
                     c.itemconfigure("o_" + i, state="normal" if op["visible"] else "hidden")
@@ -1717,6 +1800,7 @@ class App(tk.Tk):
         if k:
             op = self.rp_ops[k - 1]
             what = ("drew " + op["obj"]["kind"]) if op["op"] == "ADD" else \
+                   (f"moved {len(op['ids'])} object(s) by ({op['dx']}, {op['dy']})") if op["op"] == "MOVE" else \
                    (("restored " if op["visible"] else "erased / undid ") + f"{len(op['ids'])} object(s)")
             self.rp_label.config(text=f"op {k}/{len(self.rp_ops)}: {op.get('by', '?')} {what}")
         else:
@@ -1793,6 +1877,9 @@ class App(tk.Tk):
                 if isinstance(inner, dict) and inner.get("kind") not in (None, "enc") and "points" in inner:
                     if track:
                         self.sealed.pop(o["id"], None)
+                    ox, oy = (o.get("points") or [[0, 0]])[0]      # a moved encrypted object: the server only
+                    if ox or oy:                                      # knows its offset, the shape is inside
+                        inner["points"] = [[x + ox, y + oy] for x, y in inner["points"]]
                     return {**inner, "id": o["id"], "owner": o.get("owner")}
             except ValueError:
                 pass

@@ -19,7 +19,8 @@ Python 3.9+ (`pip install -r requirements.txt`: Pillow for PNG export and JPEG i
    - Others: enter the room code (+ password) and click **Join room**.
 
 ## Features
-Freehand pen, object eraser, line/rectangle/oval/text, colour + width, live remote strokes and cursors in each user's colour,
+**Select tool (move objects)**: pick **Select**, press on any image, shape, stroke, text or sticky note and drag it; it moves
+for everyone when you let go (dashed blue frame while dragging; Ctrl+Z moves it back). Freehand pen, object eraser, line/rectangle/oval/text, colour + width, live remote strokes and cursors in each user's colour,
 participant list with online status, group chat with timestamps, per-user undo/redo (Ctrl+Z / Ctrl+Y),
 host-only Clear / Save / Restore (saved to `saves/<room>.json` on the server), host can switch users between editor/viewer or kick,
 room password, **LAN server discovery (UDP broadcast)**, **sticky notes**, **image insertion** (PNG/GIF; JPEG/BMP need Pillow; resized to <=400px), **PNG export**, **version history**, automatic reconnect (same username + token) with full state recovery, and actions made while the
@@ -45,7 +46,7 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
 - **Phone join** (desktop client) shows a **QR code** and link. The link carries a signed **invite JWT** for that one room, valid 1 hour;
   the guest only types a name and appears as `name (web)`. No account password ever travels over the plain-HTTP page.
   Without an invite, `http://SERVER-IP:8080/` asks for name, account password and room code.
-- The page has pen, eraser, line, rect, oval, text, sticky, laser, colour, width, undo/redo, chat, live cursors, latency, and the same
+- The page has select (drag to move), pen, eraser, line, rect, oval, text, sticky, laser, colour, width, undo/redo, chat, live cursors, latency, and the same
   reliability rules (ACK + retransmit timer, seq-gap resync, auto reconnect, failover).
 - Firewall: also allow TCP 8080 (`sudo ufw allow 8080/tcp`). Limits (say so in the report): the page is HTTP, not HTTPS (a phone would
   reject the self-signed certificate), so browser traffic is readable on the LAN; browsers cannot insert images.
@@ -217,12 +218,17 @@ created in the folder the server is started from. Options: `--db path/to/file.db
 
 ## Protocol (details for the report)
 - TCP; each message = 4-byte big-endian length + UTF-8 JSON (see `protocol.py`); top bit of the length = zlib-compressed body.
-- Server stamps every canvas op (`ADD`, `VIS`) with a room-wide `seq` under a lock -> one total order for all clients.
+- Server stamps every canvas op (`ADD`, `VIS`, `MOVE`) with a room-wide `seq` under a lock -> one total order for all clients.
 - Clients apply ops only in `seq` order; duplicates (`seq` already applied, or repeated `msg_id`) are ignored; a gap triggers `RESYNC_REQ` -> `OPS_SINCE` (or `SNAPSHOT`).
 - Heartbeat: client `PING` every 1 s (carries a timestamp; the server echoes it so the client measures round-trip time), server drops a client silent for 15 s; client reconnects automatically and receives a `SNAPSHOT`.
 - Undo/redo is per user (hides/shows that user's own last action), so it never removes other users' work.
+- `MOVE {ids, dx, dy}` (Select tool): the client drags a local preview and sends ONE request on release, so a drag costs one
+  sequenced op, not a stream of positions. The server shifts the object's points (a new copy: the original `ADD` in the op log
+  is unchanged, so replay stays exact), and undo/redo sends the opposite / same shift. Any editor may move any object (like the
+  eraser). For an end-to-end encrypted object the server only shifts its offset; clients add it to the decrypted shape.
+  Limit: version restore brings back which objects are visible, not where they were.
 - Transient messages (`LIVE`, `CURSOR`) are broadcast but not stored; chat is stored with timestamps.
-- Acknowledgements: requests that change the board (`ADD`, `ERASE`, `UNDO`, `REDO`, `CLEAR`) and `CHAT` carry a `msg_id`.
+- Acknowledgements: requests that change the board (`ADD`, `ERASE`, `MOVE`, `UNDO`, `REDO`, `CLEAR`) and `CHAT` carry a `msg_id`.
   The server answers each with `ACK` after processing it (and ACKs a duplicate again without applying it). The client keeps
   un-ACKed requests in an outbox and resends them after a reconnect: at-least-once delivery + duplicate filtering = applied exactly once.
 - Server isolation: `send()` only queues an already-encoded frame; a per-client writer thread does the blocking `sendall`.
@@ -250,6 +256,8 @@ and once with TLS (unreadable) makes a strong slide.
    (`ADD  CHAT`, shows why framing is needed); a big `JOIN_OK` split over many TCP segments; PING/PONG timing; the discovery broadcast and reply.
 
 ## Tests
+`tests/test_move.py` covers the Select tool: server rules (viewers refused, undo/redo, database restart, browser guest) and two
+real clients dragging a rectangle, an image and an end-to-end encrypted shape.
 `tests/test_more.py` (no Tkinter) and `tests/test_gui_more.py` cover diagnostics, the dashboard, P2P files with resume, end-to-end
 encryption, the voice relay and jitter buffer, and IPv6 (skipped on a PC without IPv6).
 `tests/test_features.py` (no Tkinter) covers the WebSocket handshake and browser guest join, compression, ordered requests,

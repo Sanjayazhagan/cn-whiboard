@@ -14,6 +14,7 @@ reconnect. Without this, one slow laptop would freeze drawing for everyone
 Op types (state-changing, sequenced, stored):
   ADD  - a new drawable object (stroke / line / rect / oval / text / sticky note / image)
   VIS  - set visibility of object ids (used by erase, clear, undo, redo)
+  MOVE - shift object ids by (dx, dy) (select-and-drag tool; undo/redo send the opposite / same shift)
 Everything else (cursor, live stroke preview, chat, presence) is not part of the canvas log.
 
 Reliability: every client request that carries a msg_id is answered with ACK once it
@@ -494,6 +495,12 @@ class Room:
             for i in op["ids"]:
                 if i in self.objects:
                     self.objects[i]["visible"] = op["visible"]
+        elif op["op"] == "MOVE":
+            for i in op["ids"]:
+                if i in self.objects:
+                    o = self.objects[i]["obj"]
+                    # a NEW dict: the ADD op in the log keeps its original points, so replay stays exact
+                    self.objects[i]["obj"] = {**o, "points": shift(o["points"], op["dx"], op["dy"])}
         self.log.append(op)
 
     def visible_ids(self):
@@ -542,8 +549,12 @@ def valid_obj(o):
         return False
 
 
-def push_action(m, kind, ids):
-    m.undo.append({"kind": kind, "ids": ids})
+def shift(points, dx, dy):
+    return [[x + dx, y + dy] for x, y in points]
+
+
+def push_action(m, kind, ids, **extra):
+    m.undo.append({"kind": kind, "ids": ids, **extra})
     m.redo.clear()
 
 
@@ -605,7 +616,7 @@ def apply_request(client, room, m, t, msg, mid):
     """Everything that changes room state. Called with room.lock held."""
     can_edit = m.role == "editor"
     is_host = m.name == room.host
-    if not can_edit and t in ("ADD", "ERASE", "UNDO", "REDO", "LIVE"):
+    if not can_edit and t in ("ADD", "ERASE", "MOVE", "UNDO", "REDO", "LIVE"):
         stats.add(rejected=1)
 
     if t == "ADD" and can_edit:
@@ -633,6 +644,18 @@ def apply_request(client, room, m, t, msg, mid):
         if ids:
             room.commit({"op": "VIS", "ids": ids, "visible": False, "by": m.name, "msg_id": mid})
             push_action(m, "erase", ids)
+    elif t == "MOVE" and can_edit:              # select-and-drag: shift objects (any editor may move any object)
+        try:
+            dx, dy = round(float(msg.get("dx", 0))), round(float(msg.get("dy", 0)))
+        except (TypeError, ValueError, OverflowError):
+            dx = dy = 0
+        ids = [i for i in msg.get("ids", [])[:500] if isinstance(i, str) and i in room.objects
+               and room.objects[i]["visible"]]
+        if ids and (dx or dy) and abs(dx) <= 5000 and abs(dy) <= 5000:
+            room.commit({"op": "MOVE", "ids": ids, "dx": dx, "dy": dy, "by": m.name, "msg_id": mid})
+            push_action(m, "move", ids, dx=dx, dy=dy)
+        else:
+            stats.add(rejected=1)
     elif t == "CLEAR" and is_host:
         ids = room.visible_ids()
         if ids:
@@ -643,9 +666,14 @@ def apply_request(client, room, m, t, msg, mid):
         if src:
             act = src.pop()
             dst.append(act)
-            # undo of ADD hides, undo of ERASE shows; redo is the reverse
-            hide = (act["kind"] == "add") == (t == "UNDO")
-            room.commit({"op": "VIS", "ids": act["ids"], "visible": not hide, "by": m.name, "msg_id": mid})
+            if act["kind"] == "move":               # undo moves back, redo moves again
+                sign = -1 if t == "UNDO" else 1
+                room.commit({"op": "MOVE", "ids": act["ids"], "dx": sign * act["dx"], "dy": sign * act["dy"],
+                             "by": m.name, "msg_id": mid})
+            else:
+                # undo of ADD hides, undo of ERASE shows; redo is the reverse
+                hide = (act["kind"] == "add") == (t == "UNDO")
+                room.commit({"op": "VIS", "ids": act["ids"], "visible": not hide, "by": m.name, "msg_id": mid})
     elif t == "LIVE" and can_edit:             # transient stroke preview, not stored
         room.broadcast({"type": "LIVE", "user": m.name, "color": msg.get("color"),
                         "width": msg.get("width"), "points": msg.get("points", [])[-50:]}, skip=client)

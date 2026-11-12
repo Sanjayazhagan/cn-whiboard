@@ -63,6 +63,7 @@ let ws = null, joined = false, dead = false, me = "", room = "", role = "editor"
 let users = [], objs = new Map(), lastSeq = 0, resyncing = false, resyncAt = 0, seqAtPong = -1;
 let outbox = [], rn = 0, rto = 800, tries = 0, rtt = null, rtts = [];
 let tool = "pen", color = "#000000", width = 3, cur = null, live = {}, cursors = {}, lasers = {}, imgs = {};
+let drag = null, nudge = {};     // select tool: object being dragged; my moves not yet ACKed (id -> offset)
 let hosts = [location.host], hostIdx = 0, opened = false, dirty = true, lastLive = 0, lastCur = 0, erased = new Set();
 const uid = () => Array.from({length: 4}, () => Math.random().toString(16).slice(2, 10)).join("");
 const now = () => Date.now();
@@ -123,7 +124,9 @@ function handle(m) {
       outbox.forEach((x, i) => { x.rn = i + 1; }); rn = outbox.length;      // new connection: renumber, resend
       outbox.forEach(raw); sentAt = now(); tries = 0;
       break;
-    case "ACK": outbox = outbox.filter(x => x.msg_id !== m.msg_id); sentAt = now(); tries = 0; break;
+    case "ACK": outbox = outbox.filter(x => x.msg_id !== m.msg_id); sentAt = now(); tries = 0;
+      for (const i in nudge) if (nudge[i].mid === m.msg_id) { delete nudge[i]; dirty = true; }   // server position from now on
+      break;
     case "OP": applyOp(m); break;
     case "OPS_SINCE": resyncing = false; m.ops.forEach(applyOp); break;
     case "SNAPSHOT": snapshot(m); break;
@@ -174,6 +177,9 @@ function applyOp(op) {
   }
   lastSeq = op.seq;
   if (op.op === "ADD") { objs.set(op.obj.id, {obj: op.obj, visible: true}); delete live[op.by]; if (op.by === me) pending = pending.filter(p => p.id !== op.obj.id); }
+  else if (op.op === "MOVE") op.ids.forEach(i => { const r = objs.get(i); if (r) r.obj = moved(r.obj, op.dx, op.dy);
+    if (nudge[i] && nudge[i].mid === op.msg_id) delete nudge[i];            // my own move arrived: drop the preview
+    if (drag && drag.id === i && op.by !== me) drag = null; });
   else op.ids.forEach(i => { const r = objs.get(i); if (r) r.visible = op.visible; erased.delete(i); });
   dirty = true;
 }
@@ -205,7 +211,10 @@ function frame() {
   for (const u in lasers) { lasers[u] = lasers[u].filter(q => t - q.t < 900); if (lasers[u].length) anim = true; else delete lasers[u]; }
   if (!dirty && !anim) return; dirty = false;
   g.clearRect(0, 0, W, H);
-  objs.forEach(r => { if (r.visible) shape(r.obj); });
+  objs.forEach((r, id) => { if (!r.visible) return; const n = drag && drag.id === id ? drag : nudge[id];
+    shape(n ? moved(r.obj, n.dx, n.dy) : r.obj); });
+  if (drag) { const r = objs.get(drag.id), b = r && box(r.obj); if (b) { g.save(); g.strokeStyle = "#1e88e5"; g.lineWidth = 1; g.setLineDash([4, 3]);
+    g.strokeRect(b[0] + drag.dx - 3, b[1] + drag.dy - 3, b[2] - b[0] + 6, b[3] - b[1] + 6); g.restore(); } }
   pending.forEach(shape);
   for (const u in live) { const m = live[u]; if (m.points.length > 1) shape({kind: "stroke", points: m.points, color: m.color, width: m.width}); }
   if (cur) shape(cur);
@@ -237,6 +246,16 @@ function hit(o, x, y, r) {
   else { x0 = p[0][0]; y0 = p[0][1]; x1 = x0 + (o.text || "").length * (o.width * 2 + 6); y1 = y0 + o.width * 4 + 12; }
   return x >= x0 - r && x <= x1 + r && y >= y0 - r && y <= y1 + r;
 }
+function moved(o, dx, dy) { return Object.assign({}, o, {points: o.points.map(p => [p[0] + dx, p[1] + dy])}); }
+function box(o) {                                         // bounding box [x0, y0, x1, y1] for the selection frame
+  const p = o.points, k = o.kind;
+  if (k === "sticky") return [p[0][0], p[0][1], p[0][0] + 160, p[0][1] + 120];
+  if (k === "image") return [p[0][0], p[0][1], p[0][0] + o.w, p[0][1] + o.h];
+  if (k === "text") return [p[0][0], p[0][1], p[0][0] + (o.text || "").length * (o.width * 2 + 6), p[0][1] + o.width * 4 + 12];
+  const xs = p.map(q => q[0]), ys = p.map(q => q[1]), r = o.width / 2;
+  return [Math.min(...xs) - r, Math.min(...ys) - r, Math.max(...xs) + r, Math.max(...ys) + r];
+}
+function objectAt(x, y) { let found = null; objs.forEach((r, id) => { if (r.visible && hit(r.obj, x, y, 4)) found = id; }); return found; }   // topmost = last drawn
 function eraseAt(x, y) {
   const ids = []; objs.forEach((r, id) => { if (r.visible && !erased.has(id) && hit(r.obj, x, y, 5 + width)) ids.push(id); });
   if (ids.length) { ids.forEach(i => erased.add(i)); rel({type: "ERASE", ids: ids}); }
@@ -248,6 +267,7 @@ cv.addEventListener("pointerdown", e => {
   cv._down = true;
   if (tool === "text" || tool === "sticky") { cv._down = false; const s = prompt(tool === "text" ? "Enter text:" : "Note text:"); if (s) add({kind: tool, color: color, width: width, points: [[x, y]], text: s.slice(0, tool === "text" ? 500 : 300)}); }
   else if (tool === "eraser") eraseAt(x, y);
+  else if (tool === "select") { cur = null; const id = objectAt(x, y); drag = id ? {id: id, x0: x, y0: y, dx: 0, dy: 0} : null; }
   else cur = {kind: tool === "pen" ? "stroke" : tool, color: color, width: width, points: tool === "pen" ? [[x, y]] : [[x, y], [x, y]]};
   dirty = true;
 });
@@ -257,18 +277,22 @@ cv.addEventListener("pointermove", e => {
   if (!cv._down) return;
   if (tool === "laser") return laser(x, y);
   if (tool === "eraser") return eraseAt(x, y);
+  if (drag) { drag.dx = x - drag.x0; drag.dy = y - drag.y0; dirty = true; return; }
   if (!cur) return;
   if (cur.kind === "stroke") { const l = cur.points[cur.points.length - 1]; if (Math.abs(x - l[0]) + Math.abs(y - l[1]) < 2) return; cur.points.push([x, y]);
     if (t - lastLive > 40) { lastLive = t; raw({type: "LIVE", color: color, width: width, points: cur.points.slice(-50)}); } }
   else cur.points[1] = [x, y];
   dirty = true;
 });
-function up() { cv._down = false; if (!cur) return; const o = cur; cur = null; if (o.kind === "stroke") o.points = rdp(o.points, 1.0); add(o); }
+function up() { cv._down = false;
+  if (drag) { const d = drag; drag = null; dirty = true;
+    if (d.dx || d.dy) { const m = {type: "MOVE", ids: [d.id], dx: d.dx, dy: d.dy}; rel(m); nudge[d.id] = {dx: d.dx, dy: d.dy, mid: m.msg_id}; } return; }
+  if (!cur) return; const o = cur; cur = null; if (o.kind === "stroke") o.points = rdp(o.points, 1.0); add(o); }
 cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
 function laser(x, y) { (lasers[me] = lasers[me] || []).push({x: x, y: y, t: now()}); raw({type: "LASER", x: x, y: y}); dirty = true; }
 
 // ---------------------------------------------------------------- toolbar
-const bar = $("bar"), tools = ["pen", "eraser", "line", "rect", "oval", "text", "sticky", "laser"];
+const bar = $("bar"), tools = ["select", "pen", "eraser", "line", "rect", "oval", "text", "sticky", "laser"];
 tools.forEach(t => { const b = document.createElement("button"); b.textContent = t[0].toUpperCase() + t.slice(1); b.dataset.t = t; if (t === tool) b.className = "on";
   b.onclick = () => { tool = t; bar.querySelectorAll("button[data-t]").forEach(x => x.className = x.dataset.t === t ? "on" : ""); }; bar.appendChild(b); });
 const col = document.createElement("input"); col.type = "color"; col.value = color; col.setAttribute("aria-label", "Colour"); col.oninput = () => { color = col.value; }; bar.appendChild(col);
