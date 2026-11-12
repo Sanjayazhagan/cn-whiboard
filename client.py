@@ -402,6 +402,12 @@ class App(tk.Tk):
             self.awaiting = False
             messagebox.showerror("Cannot connect", f"TLS handshake failed ({e.reason}).\n\n"
                                  "If the server runs with --no-tls, untick 'Encrypted connection'.")
+        except (ConnectionResetError, ConnectionAbortedError) as e:
+            self.awaiting = False
+            # a plain server closes the connection on a TLS ClientHello: Linux reports an SSLError, Windows a reset
+            hint = ("\n\nIf the server runs with --no-tls, untick 'Encrypted connection'." if tls else
+                    "\n\nIf the server uses TLS, tick 'Encrypted connection'.")
+            messagebox.showerror("Cannot connect", f"{e}{hint}")
         except (OSError, ValueError) as e:
             self.awaiting = False
             messagebox.showerror("Cannot connect", str(e))
