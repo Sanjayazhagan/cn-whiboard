@@ -4,6 +4,8 @@
 --           One TCP segment can carry several messages, and one big message
 --           (e.g. JOIN_OK with a snapshot) is split over many segments;
 --           dissect_tcp_pdus() reassembles them using the length prefix.
+--           Frames of 256+ bytes may be zlib-compressed (top bit of the length set); start the
+--           server with --no-compress (and --no-tls) for a capture that is plain text throughout.
 -- UDP 5051: LAN discovery (WB_DISCOVER_V1 broadcast, JSON WB_SERVER reply).
 --
 -- With TLS on (the default) the TCP payload is encrypted: Wireshark shows only TLS records.
@@ -32,15 +34,32 @@ wb.prefs.port = Pref.uint("TCP port", 5050, "Whiteboard server TCP port")
 local json = Dissector.get("json")
 local tls = Dissector.get("tls")
 
+-- The top bit of the length marks a zlib-compressed body (frames >= 256 bytes, see protocol.py).
 local function pdu_len(tvb, pinfo, offset)
-    return tvb(offset, 4):uint() + 4
+    return bit.band(tvb(offset, 4):uint(), 0x7FFFFFFF) + 4
 end
 
 local function dissect_pdu(tvb, pinfo, tree)
-    local len = tvb(0, 4):uint()
+    local rawlen = tvb(0, 4):uint()
+    local len = bit.band(rawlen, 0x7FFFFFFF)
+    local compressed = rawlen >= 0x80000000
     local body = tvb(4, len)
+    if compressed then
+        -- inflate; if this Wireshark build cannot, the frame is still shown as "compressed"
+        local ok, plain = pcall(function() return body:uncompress("Whiteboard JSON (inflated)") end)
+        if ok and plain then
+            body = plain
+        else
+            local t = tree:add(wb, tvb(0, len + 4), "LAN Whiteboard: zlib-compressed frame (" .. len .. " bytes)")
+            t:add(f_len, tvb(0, 4), len)
+            pinfo.cols.protocol = "WHITEBOARD"
+            pinfo.cols.info:append("[compressed]  ")
+            return len + 4
+        end
+    end
+    local blen = body:len()
     -- only look at the start of huge bodies (snapshots, images) for the summary fields
-    local head = body:range(0, math.min(len, 400)):string()
+    local head = body:range(0, math.min(blen, 400)):string()
     local typ = head:match('^{"type":"([^"]+)"') or head:match('"type":"([^"]+)"') or "?"
     local op = head:match('"op":"([^"]+)"')
     local seq = head:match('"seq":(%d+)')
@@ -50,18 +69,19 @@ local function dissect_pdu(tvb, pinfo, tree)
     local label = typ
     if op then label = label .. " " .. op end
     if seq then label = label .. " seq=" .. seq end
-    local t = tree:add(wb, tvb(0, len + 4), "LAN Whiteboard: " .. label .. " (" .. len .. " bytes)")
-    t:add(f_len, tvb(0, 4))
+    local t = tree:add(wb, tvb(0, len + 4), "LAN Whiteboard: " .. label .. " (" .. len .. " bytes"
+                       .. (compressed and (", zlib, " .. blen .. " inflated)") or ")"))
+    t:add(f_len, tvb(0, 4), len)
     t:add(f_type, body, typ)
     if op then t:add(f_op, body, op) end
     if seq then t:add(f_seq, body, tonumber(seq)) end
     if mid then t:add(f_msgid, body, mid) end
     if user then t:add(f_user, body, user) end
     local before = tostring(pinfo.cols.info)
-    if json and len < 65536 then
+    if json and blen < 65536 then
         json:call(body:tvb(), pinfo, t)          -- full JSON tree (the JSON dissector also edits the columns)
     else
-        t:add(f_body, body, head .. (len > 400 and " ..." or ""))
+        t:add(f_body, body, head .. (blen > 400 and " ..." or ""))
     end
     pinfo.cols.protocol = "WHITEBOARD"
     pinfo.cols.info:set(before .. label .. "  ")

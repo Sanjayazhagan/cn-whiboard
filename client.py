@@ -9,6 +9,13 @@ Reliability: requests that change the board (ADD, ERASE, UNDO, REDO, CLEAR) and 
 carry a msg_id and stay in an "outbox" until the server ACKs them. After a reconnect
 everything still in the outbox is sent again; the server ignores ids it has already
 processed, so nothing is lost and nothing is applied twice.
+
+The same outbox is also covered by a retransmit timer (ARQ): every request has a request
+number `rn`; if the oldest one is not ACKed within the timeout (derived from the measured
+round-trip time, doubled on every retry) all unACKed requests are sent again in order. The
+server processes requests strictly in rn order and holds back any that arrive early. Together with the sequence-gap
+resync and the heartbeat check ("the server is at seq N, am I?") the board repairs itself
+when messages are lost - which the Chaos lab window lets the host do on purpose.
 """
 import base64
 import io
@@ -26,7 +33,11 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from collections import deque
 
 from protocol import (DEFAULT_PORT, DISCOVER_MAGIC, DISCOVERY_PORT, HEARTBEAT_SEC, TIMEOUT_SEC,
-                      recv_msg_ex, send_msg)
+                      compress_frame, encode_msg, is_loopback, recv_frame, simplify)
+import diagnose
+import e2e
+import p2p
+import voice
 
 from auth import fingerprint
 
@@ -43,6 +54,10 @@ try:                      # Pillow is optional: needed for PNG export and JPEG/l
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     Image = None
+try:                      # optional: draws the QR code for "Phone join" (the link is shown either way)
+    import qrcode
+except ImportError:
+    qrcode = None
 
 
 def pastel(color):
@@ -109,14 +124,32 @@ class Net:
         self.q, self.sock, self.gen = q, None, 0
         self.open, self.target = False, None
         self.tls_info = None      # (TLS version, cipher, certificate fingerprint) or None for plain TCP
+        self.family = "IPv4"
         self.lock = threading.Lock()
         # traffic counters (read by the Network window)
         self.tx_bytes = self.rx_bytes = self.tx_msgs = self.rx_msgs = 0
         self.pings_sent = 0
         self.last_rtt = None
+        self.tx_raw = self.rx_raw = 0         # bytes before compression (to show what compression saved)
+        self.trace = deque(maxlen=3000)       # every frame sent/received, for the packet inspector
+        self.trace_n = 0
 
-    def connect(self, host, port, first_msg, tls=False, check=None):
-        s = socket.create_connection((host, port), timeout=5)
+    def record(self, direction, msg, wire, raw, z, retx=False):
+        self.trace_n += 1
+        self.trace.append((self.trace_n, time.time(), direction, msg, wire, raw, z, retx))
+
+    def _put(self, s, msg, retx=False):
+        """Encode, compress if that helps, send. Caller holds self.lock (or is the only sender)."""
+        plain = encode_msg(msg)
+        frame = compress_frame(plain)
+        s.sendall(frame)
+        self.tx_bytes += len(frame)
+        self.tx_raw += len(plain)
+        self.tx_msgs += 1
+        self.record("tx", msg, len(frame), len(plain), frame is not plain, retx)
+
+    def connect(self, host, port, first_msg, tls=False, check=None, timeout=5):
+        s = socket.create_connection((host, port), timeout=timeout)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -138,19 +171,21 @@ class Net:
         else:
             self.tls_info = None
         s.settimeout(TIMEOUT_SEC)       # server answers our PING every 1 s; 15 s of silence = dead link
+        self.family = "IPv6" if s.family == socket.AF_INET6 else "IPv4"
         self.sock, self.gen = s, self.gen + 1
         self.open, self.target = True, ((host, port), tls)
-        self.tx_bytes += send_msg(s, first_msg)
-        self.tx_msgs += 1
+        self._put(s, first_msg)
         threading.Thread(target=self._reader, args=(s, self.gen), daemon=True).start()
         threading.Thread(target=self._beat, args=(s, self.gen), daemon=True).start()
 
     def _reader(self, s, gen):
         try:
             while gen == self.gen:
-                msg, n = recv_msg_ex(s)
+                msg, n, raw, z = recv_frame(s)
                 self.rx_bytes += n
+                self.rx_raw += raw
                 self.rx_msgs += 1
+                self.record("rx", msg, n, raw, z)
                 self.q.put(msg)
         except (OSError, ValueError):
             pass
@@ -166,12 +201,11 @@ class Net:
             # server our last RTT so every client can show everyone's latency
             self.send({"type": "PING", "t": time.time() * 1000, "rtt": self.last_rtt}, s)
 
-    def send(self, msg, s=None):
+    def send(self, msg, s=None, retx=False):
         s = s or self.sock
         try:
             with self.lock:
-                self.tx_bytes += send_msg(s, msg)
-                self.tx_msgs += 1
+                self._put(s, msg, retx)
         except AttributeError:
             pass
         except OSError:            # broken connection: wake the reader so reconnecting starts right away
@@ -219,6 +253,18 @@ class App(tk.Tk):
         self.offline = False      # connection is gone for good (kicked / room no longer exists)
         self.outbox = {}          # msg_id -> request not yet ACKed by the server (insertion ordered)
         self.resent = self.acked = 0
+        self.rn = 0               # request number of the newest reliable request
+        self.sent_at, self.rto_tries, self.retx, self.dup_acks = 0.0, 0, 0, 0
+        self.resync_at, self.seq_at_pong, self.hb_resyncs = 0.0, -1, 0
+        self.chaos, self.backups, self.web_port, self.kinds = None, [], None, {}
+        self.rc_target, self.failovers = None, 0
+        self.pts_raw = self.pts_sent = 0      # stroke points before / after simplification
+        self.labwin = self.inspwin = self.replaywin = self.qrwin = None
+        self.e2e_keys, self.sealed, self.pending_plain = None, {}, {}   # end-to-end encryption
+        self.file_out = {}                    # offer id -> p2p.Sender (files I am offering)
+        if getattr(self, "vc", None):
+            self.close_voice()
+        self.voice_port, self.vc, self.audio, self.voicewin = None, None, None, None
         self.live, self.cursors, self.erased = {}, {}, set()
         self.rtts = deque(maxlen=60)          # recent round-trip samples (ms)
         self.pongs = 0
@@ -258,7 +304,10 @@ class App(tk.Tk):
         head("1. Server")
         self.find_btn = ttk.Button(f, text="Find servers on LAN", command=self.find_servers)
         self.find_btn.grid(row=r, column=0, sticky="w")
-        ttk.Label(f, text="(click a server to use it)", foreground="#666").grid(row=r, column=1, sticky="w")
+        row = ttk.Frame(f)
+        row.grid(row=r, column=1, sticky="w")
+        ttk.Label(row, text="(click a server to use it)", foreground="#666").pack(side="left")
+        ttk.Button(row, text="Diagnose connection", command=self.open_diagnose).pack(side="left", padx=8)
         r += 1
         self.srv_list = tk.Listbox(f, height=3, width=52, exportselection=False)
         self.srv_list.grid(row=r, column=0, columnspan=2, pady=4)
@@ -314,6 +363,8 @@ class App(tk.Tk):
         self.srv_list.delete(0, "end")
         for sv in self.found:
             sec = ("TLS" if sv.get("tls") else "no TLS") + (", accounts" if sv.get("auth") else "")
+            if sv.get("role") == "standby":
+                sec += ", STANDBY"
             self.srv_list.insert("end", f"{sv.get('name', '?')}  {sv['addr']}:{sv['port']}  [{sec}]  "
                                         f"{sv.get('rooms', 0)} rooms, {sv.get('users', 0)} online")
         if not self.found:
@@ -366,7 +417,7 @@ class App(tk.Tk):
         conn, tls, v = self.target()
         if kind == "JOIN_ROOM" and not v["room"]:
             return messagebox.showerror("Error", "Enter the room code")
-        msg = {"type": kind, "user": v["user"], "room": v["room"], "password": v["pw"]}
+        msg = {"type": kind, "user": v["user"], "room": v["room"], "password": v["pw"], "z": 1}
         self.password = v["pw"]
         if self.jwt and self.jwt_server == (conn, tls) and self.jwt_user.lower() == (v["user"] or self.jwt_user).lower():
             msg["jwt"] = self.jwt                   # already logged in on this server
@@ -452,7 +503,7 @@ class App(tk.Tk):
         bar = ttk.Frame(self)
         bar.pack(side="top", fill="x")
         self.tool_var = tk.StringVar(self, value="pen")
-        for t in ("pen", "eraser", "line", "rect", "oval", "text", "sticky", "image"):
+        for t in ("pen", "eraser", "line", "rect", "oval", "text", "sticky", "image", "laser"):
             ttk.Radiobutton(bar, text=t.title(), value=t, variable=self.tool_var,
                             command=lambda: setattr(self, "tool", self.tool_var.get())).pack(side="left", padx=2)
         self.color_btn = tk.Button(bar, text="  Color  ", bg=self.color, fg="white", command=self.pick_color)
@@ -482,7 +533,12 @@ class App(tk.Tk):
         self.lat_label = tk.Label(foot, text="● measuring...", fg="#888", cursor="hand2")
         self.lat_label.pack(side="right", padx=8)
         self.lat_label.bind("<Button-1>", lambda e: self.open_network())
-        ttk.Button(foot, text="Network", command=self.open_network).pack(side="right")
+        for txt, cmd in (("Network", self.open_network), ("Inspector", self.open_inspector),
+                         ("Chaos lab", self.open_lab), ("Replay", self.open_replay),
+                         ("Phone join", lambda: self.net.send({"type": "INVITE_REQ"}))):
+            ttk.Button(foot, text=txt, command=cmd).pack(side="right")
+        self.chaos_label = tk.Label(foot, text="", fg="#b26a00")
+        self.chaos_label.pack(side="left", padx=8)
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
@@ -498,6 +554,14 @@ class App(tk.Tk):
             r.pack(fill="x")
             ttk.Button(r, text="Toggle edit/view", command=self.toggle_role).pack(side="left")
             ttk.Button(r, text="Kick", command=self.kick).pack(side="left")
+        r = ttk.Frame(side)
+        r.pack(fill="x", pady=(2, 0))
+        ttk.Button(r, text="Send file", width=9, command=self.send_file).pack(side="left")
+        ttk.Button(r, text="Voice", width=6, command=self.open_voice).pack(side="left")
+        self.e2e_btn = ttk.Button(r, text="E2E key", width=9, command=self.ask_e2e)
+        self.e2e_btn.pack(side="left")
+        self.file_label = ttk.Label(side, text="", foreground="#555")
+        self.file_label.pack(anchor="w")
         ttk.Label(side, text="Chat").pack(anchor="w", pady=(8, 0))
         self.chat = tk.Text(side, width=32, height=22, state="disabled", wrap="word")
         self.chat.pack(fill="y", expand=True)
@@ -511,6 +575,7 @@ class App(tk.Tk):
         c.bind("<Motion>", self.on_move)
         self.tick_gen += 1
         self.after(1000, self.net_tick, self.tick_gen)
+        self.after(200, self.rto_tick, self.tick_gen)
         self.bind("<Control-z>", lambda e: self.send_reliable({"type": "UNDO"}))
         self.bind("<Control-y>", lambda e: self.send_reliable({"type": "REDO"}))
 
@@ -518,21 +583,62 @@ class App(tk.Tk):
         """Send a request that must not be lost: it keeps a msg_id and stays in the outbox until ACKed.
         If the connection is down, the send fails silently and the request goes out after reconnecting."""
         msg["msg_id"] = uuid.uuid4().hex
+        if msg.get("type") == "ADD" and self.e2e_keys:      # end-to-end: replace the object by its ciphertext
+            o = msg["obj"]
+            self.pending_plain[o["id"]] = o
+            body = json.dumps({k: v for k, v in o.items() if k != "id"}, separators=(",", ":")).encode("utf-8")
+            msg["obj"] = {"id": o["id"], "kind": "enc", "color": "#000000", "width": 1, "points": [[0, 0]],
+                          "data": e2e.seal(self.e2e_keys, body)}
+        self.rn += 1
+        msg["rn"] = self.rn                     # request number: the server handles requests in this order
+        if not self.outbox:
+            self.sent_at, self.rto_tries = time.time(), 0
         self.outbox[msg["msg_id"]] = msg
         self.net.send(msg)
+        if self.reconnecting:                   # offline mode: show it locally and count it
+            self.canvas.delete("preview")
+            self.draw_pending()
+            self.show_offline()
 
     def resend_outbox(self):
         for msg in list(self.outbox.values()):
-            self.net.send(msg)
+            self.net.send(msg, retx=True)
             self.resent += 1
+
+    def rto(self):
+        """Retransmission timeout in seconds: 3 x the average measured round trip, within 0.6 .. 3 s."""
+        r = list(self.rtts)
+        return min(3.0, max(0.6, 3 * sum(r) / len(r) / 1000)) if r else 1.0
+
+    def rto_tick(self, gen):
+        """Retransmit timer, 5 times a second. When the oldest unACKed request times out, send ALL
+        unACKed requests again in order, and wait twice as long before the next round."""
+        if gen != self.tick_gen or not hasattr(self, "canvas"):
+            return
+        now = time.time()
+        if self.net.open and not self.reconnecting and not self.offline:
+            if self.outbox and now - self.sent_at > self.rto() * min(8, 2 ** self.rto_tries):
+                for msg in list(self.outbox.values()):
+                    self.net.send(msg, retx=True)
+                    self.retx += 1
+                self.sent_at, self.rto_tries = now, self.rto_tries + 1
+            if self.resyncing and now - self.resync_at > max(1.5, self.rto()):
+                self.resync_at = now               # the resync request or its answer was lost: ask again
+                self.net.send({"type": "RESYNC_REQ", "since": self.last_seq})
+        self.after(200, self.rto_tick, gen)
 
     def show_security(self):
         ti = self.net.tls_info
+        extra = ""
+        if self.e2e_keys:
+            extra = "  +  end-to-end key" + (f" ({len(self.sealed)} object(s) unreadable)" if self.sealed else "")
+        elif self.sealed:
+            extra = f"  |  {len(self.sealed)} end-to-end encrypted object(s): set the E2E key to see them"
         if ti:
-            self.sec_label.config(text=f"\U0001F512 {ti[0]} encrypted" + (f" - {self.me} (logged in)" if self.jwt else ""),
-                                  fg="#2e7d32")
+            self.sec_label.config(text=f"\U0001F512 {ti[0]} encrypted" + (f" - {self.me} (logged in)" if self.jwt else "")
+                                  + extra, fg="#2e7d32")
         else:
-            self.sec_label.config(text="\u26A0 not encrypted", fg="#c62828")
+            self.sec_label.config(text="\u26A0 not encrypted" + extra, fg="#c62828")
 
     def pick_color(self):
         c = colorchooser.askcolor(color=self.color)[1]
@@ -544,8 +650,17 @@ class App(tk.Tk):
     def send_chat(self, _e):
         t = self.chat_entry.get().strip()
         if t:
+            if self.e2e_keys:                       # the server relays and stores only ciphertext
+                t = e2e.PREFIX + e2e.seal(self.e2e_keys, t[:600].encode("utf-8"))
             self.send_reliable({"type": "CHAT", "text": t})
             self.chat_entry.delete(0, "end")
+
+    def chat_text(self, t):
+        if not t.startswith(e2e.PREFIX):
+            return t
+        plain = e2e.unseal(self.e2e_keys, t[len(e2e.PREFIX):]) if self.e2e_keys else None
+        return ("\U0001F510 " + plain.decode("utf-8", "replace")) if plain is not None else \
+            "[end-to-end encrypted message - set the same E2E key to read it]"
 
     def add_chat(self, line, tag=None):
         self.chat.config(state="normal")
@@ -696,7 +811,17 @@ class App(tk.Tk):
             self.last_cursor = now
             self.net.send({"type": "CURSOR", "x": e.x, "y": e.y})
 
+    def laser_at(self, x, y, user=None):
+        """Laser pointer: a red dot that everyone sees for a moment; never stored."""
+        if user is None:
+            self.net.send({"type": "LASER", "x": x, "y": y})
+        it = self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#ff1744", outline="#ff8a80", width=3, tags="laser")
+        self.after(350, lambda: self.canvas.itemconfigure(it, fill="#ff8a80", outline=""))
+        self.after(700, lambda: self.canvas.delete(it))
+
     def on_press(self, e):
+        if self.tool == "laser" and not self.offline:     # viewers may point too
+            return self.laser_at(e.x, e.y)
         if not self.can_draw():
             return
         self.cur_pts = [[e.x, e.y]]
@@ -714,6 +839,12 @@ class App(tk.Tk):
             self.erase_at(e)
 
     def on_drag(self, e):
+        if self.tool == "laser" and not self.offline:
+            self.on_move(e)
+            if time.time() - self.last_live > 0.03:
+                self.last_live = time.time()
+                self.laser_at(e.x, e.y)
+            return
         if not self.can_draw() or not self.cur_pts:
             return
         self.on_move(e)
@@ -726,7 +857,7 @@ class App(tk.Tk):
             self.cur_pts.append([e.x, e.y])
             self.canvas.create_line(lx, ly, e.x, e.y, fill=self.color, width=self.width,
                                     capstyle="round", tags="preview")
-            if time.time() - self.last_live > 0.04:
+            if time.time() - self.last_live > 0.04 and not self.e2e_keys:   # a live preview would leak the stroke
                 self.last_live = time.time()
                 self.net.send({"type": "LIVE", "color": self.color, "width": self.width,
                                "points": self.cur_pts[-50:]})
@@ -740,7 +871,10 @@ class App(tk.Tk):
         if not self.can_draw() or not self.cur_pts:
             return
         if self.tool == "pen":
-            self.send_add("stroke", self.cur_pts)
+            pts = simplify(self.cur_pts, 1.0)      # Ramer-Douglas-Peucker: same shape, far fewer points
+            self.pts_raw += len(self.cur_pts)
+            self.pts_sent += len(pts)
+            self.send_add("stroke", pts)
         elif self.tool in ("line", "rect", "oval") and len(self.cur_pts) == 2:
             self.send_add(self.tool, self.cur_pts)
         self.cur_pts = []
@@ -765,12 +899,14 @@ class App(tk.Tk):
             self.send_reliable({"type": "ERASE", "ids": list(hits)})
 
     # ------------------------------------------------------------ rendering
-    def make_item(self, kind, pts, color, width, text, tags):
-        c = self.canvas
+    def make_item(self, kind, pts, color, width, text, tags, canvas=None):
+        c = canvas or self.canvas
+        if kind == "enc":                 # end-to-end encrypted and we have no (or the wrong) key: nothing to draw
+            return None
         if kind == "image":
             ph = self.photos.get(tags[-1])
             if ph is None:
-                ph = self.photos[tags[-1]] = tk.PhotoImage(master=self.canvas, data=text)    # `text` carries base64 data here
+                ph = self.photos[tags[-1]] = tk.PhotoImage(master=self, data=text)    # `text` carries base64 data here
             return c.create_image(*pts[0], image=ph, anchor="nw", tags=tags)
         if kind == "stroke":
             if len(pts) == 1:
@@ -804,9 +940,10 @@ class App(tk.Tk):
         """Replace everything from a full snapshot (join, reconnect, or big gap)."""
         self.canvas.delete("all")
         self.live.clear(); self.cursors.clear(); self.erased.clear(); self.photos.clear()
-        self.objs = {}
+        self.objs, self.sealed = {}, {}
         for o in snap["objects"]:
             vis = o.pop("visible")
+            o = self.reveal(o)
             self.objs[o["id"]] = {"obj": o, "visible": vis}
             self.draw_obj(o, vis)
         self.last_seq, self.resyncing = snap["seq"], False
@@ -818,16 +955,19 @@ class App(tk.Tk):
         if op["seq"] != self.last_seq + 1:          # gap: ask the server for what we missed
             if not self.resyncing:
                 self.resyncing = True
+                self.resync_at = time.time()
                 self.gaps += 1
                 self.net.send({"type": "RESYNC_REQ", "since": self.last_seq})
             return
         self.last_seq = op["seq"]
         if op["op"] == "ADD":
-            o = op["obj"]
+            o = self.reveal(op["obj"])
+            self.pending_plain.pop(o["id"], None)
             self.objs[o["id"]] = {"obj": o, "visible": True}
             self.draw_obj(o, True)
             if op.get("by") == self.me:
                 self.canvas.delete("preview")
+                self.draw_pending()                 # the ones still waiting for their turn stay visible
             if op.get("by") in self.live:
                 self.canvas.delete(self.live.pop(op["by"]))
         else:
@@ -888,16 +1028,40 @@ class App(tk.Tk):
             if self.reconnecting:
                 self.reconnects += 1
             self.reconnecting = False
+            if was_reconnect and self.rc_target and self.rc_target != (self.conn, self.use_tls):
+                old = self.conn                       # we are on a standby that took over: stay with it
+                self.conn, self.use_tls = self.rc_target
+                if self.jwt:
+                    self.jwt_server = (self.conn, self.use_tls)
+                self.failovers += 1
+            else:
+                old = None
             self.status.config(text=f"Room code: {self.room}", foreground="#006")
             self.show_security()
             self.load_snapshot(m["snapshot"])
+            self.web_port, self.voice_port = m.get("web"), m.get("voice")
+            if self.vc:                               # voice follows the board to the new connection
+                self.start_voice()
+            self.set_backups(m.get("backups", []))
+            self.show_chaos(m.get("chaos"))
+            for i, req in enumerate(self.outbox.values(), 1):    # new connection: number the requests from 1
+                req["rn"] = i
+            self.rn, self.sent_at, self.rto_tries = len(self.outbox), time.time(), 0
             self.chat.config(state="normal"); self.chat.delete("1.0", "end"); self.chat.config(state="disabled")
             for c in m["chat"]:
-                self.add_chat(f"[{c['ts']}] {c['user']}: {c['text']}")
+                self.add_chat(f"[{c['ts']}] {c['user']}: {self.chat_text(c['text'])}")
             self.refresh_users()
+            if old:
+                self.add_chat(f"* FAILOVER: {old[0]}:{old[1]} is down - now connected to the standby server "
+                              f"{self.conn[0]}:{self.conn[1]}. Nothing was lost.")
             if was_reconnect and self.outbox:     # whatever the server never confirmed goes out again
-                self.add_chat(f"* reconnected - resending {len(self.outbox)} unconfirmed action(s)")
+                self.draw_pending()
+                self.add_chat(f"* back online - delivering {len(self.outbox)} action(s) made while offline")
                 self.resend_outbox()
+        elif t == "JOIN_ERR" and m.get("code") == "STANDBY" and self.reconnecting:
+            self.net.close()                      # a standby that has not taken over (yet): keep looking
+            self.rc_idx += 1
+            threading.Thread(target=self._reconnect_loop, args=(1.0,), daemon=True).start()
         elif t == "JOIN_ERR":
             self.net.close()
             if self.reconnecting:                 # our room is gone (server restarted) or we were banned
@@ -914,6 +1078,28 @@ class App(tk.Tk):
         elif t == "ACK":
             if self.outbox.pop(m.get("msg_id"), None) is not None:
                 self.acked += 1
+                self.sent_at, self.rto_tries = time.time(), 0      # progress: restart the retransmit timer
+            if m.get("dup"):
+                self.dup_acks += 1
+        elif t == "CHAOS":
+            self.show_chaos(m.get("chaos"))
+            self.add_chat(f"* chaos lab {'ON' if m.get('chaos') else 'off'} (set by {m.get('by')})")
+        elif t == "BACKUPS":
+            self.set_backups(m.get("backups", []))
+        elif t == "INVITE":
+            self.show_invite(m)
+        elif t == "REPLAY":
+            self.show_replay(m["ops"])
+        elif t == "_DIAG":
+            self.diag_line(m)
+        elif t == "FILE_OFFER":
+            self.file_offered(m)
+        elif t == "FILE_REPLY":
+            self.file_reply(m)
+        elif t == "_FILE":
+            self.file_event(m)
+        elif t == "LASER":
+            self.laser_at(m["x"], m["y"], m.get("user"))
         elif t == "KICKED":
             self.go_offline(m.get("text", "You were removed from the room by the host"))
         elif t == "_DISCOVERED":
@@ -931,6 +1117,19 @@ class App(tk.Tk):
                 self.pongs += 1
                 self.net.last_rtt = round(rtt, 1)
             self.srv_stats, self.peers = m.get("stats", {}), m.get("peers", {})
+            self.kinds = m.get("kinds", {})
+            # Heartbeat anti-entropy: the PONG says which seq the room is at. If we are still behind on
+            # two PONGs in a row without having moved, the last op(s) were lost with nothing after them
+            # to reveal the gap - so ask for them.
+            srv_seq = self.srv_stats.get("room_seq")
+            if isinstance(srv_seq, int) and srv_seq > self.last_seq and not self.resyncing and self.room:
+                if self.seq_at_pong == self.last_seq:
+                    self.resyncing, self.resync_at = True, time.time()
+                    self.hb_resyncs += 1
+                    self.net.send({"type": "RESYNC_REQ", "since": self.last_seq})
+                self.seq_at_pong = self.last_seq
+            else:
+                self.seq_at_pong = -1
             if hasattr(self, "canvas"):            # PONGs also arrive while still on the login screen
                 self.update_badge()
                 self.refresh_users()
@@ -949,7 +1148,7 @@ class App(tk.Tk):
         elif t == "CURSOR":
             self.draw_cursor(m)
         elif t == "CHAT":
-            self.add_chat(f"[{m['ts']}] {m['user']}: {m['text']}")
+            self.add_chat(f"[{m['ts']}] {m['user']}: {self.chat_text(m['text'])}")
         elif t == "USERS":
             self.users = m["users"]
             me = next((u for u in self.users if u["name"] == self.me), None)
@@ -1022,6 +1221,11 @@ class App(tk.Tk):
         self.update_badge()
         if self.netwin and self.netwin.winfo_exists():
             self.draw_network()
+        if self.labwin and self.labwin.winfo_exists():
+            self.draw_lab()
+        if self.reconnecting:
+            self.show_offline()
+        self.show_security()
         self.after(1000, self.net_tick, gen)
 
     def open_network(self):
@@ -1032,7 +1236,7 @@ class App(tk.Tk):
         w.title("Network statistics")
         self.graph = tk.Canvas(w, width=420, height=120, bg="white", highlightthickness=1)
         self.graph.pack(padx=8, pady=(8, 4))
-        self.net_text = tk.Text(w, width=58, height=40, font=("Courier", 10), state="disabled", bg="#f7f7f7")
+        self.net_text = tk.Text(w, width=62, height=46, font=("Courier", 10), state="disabled", bg="#f7f7f7")
         self.net_text.pack(padx=8, pady=(0, 8))
         self.draw_network()
 
@@ -1064,12 +1268,21 @@ class App(tk.Tk):
               f"  sent     {kb(self.net.tx_bytes)}   {self.net.tx_msgs:7d} msgs",
               f"  received {kb(self.net.rx_bytes)}   {self.net.rx_msgs:7d} msgs",
               "", "RELIABILITY",
-              f"  connection        {'OFFLINE' if self.offline else 'RECONNECTING' if self.reconnecting else 'connected'} to {self.conn[0]}:{self.conn[1]}",
+              f"  connection        {'OFFLINE' if self.offline else 'RECONNECTING' if self.reconnecting else 'connected'} to {self.conn[0]}:{self.conn[1]} ({self.net.family})",
               f"  reconnects        {self.reconnects}",
               f"  awaiting ACK      {len(self.outbox)}    acked {self.acked}    resent {self.resent}",
               f"  duplicate ops ignored {self.dup_ops}    gaps resynced {self.gaps}",
+              f"  retransmit timer  RTO {self.rto() * 1000:.0f} ms   retransmitted {self.retx}   dup ACKs {self.dup_acks}",
+              f"  heartbeat resyncs {self.hb_resyncs}    failovers to standby {self.failovers}",
               f"  last op seq       {self.last_seq}",
               f"  session time      {int(time.time() - self.t_start)} s"]
+        tr, tw, rr, rw = self.net.tx_raw, self.net.tx_bytes, self.net.rx_raw, self.net.rx_bytes
+        pct = lambda raw, wire: f"{100 * (1 - wire / raw):4.1f} % saved" if raw else "-"
+        L += ["", "BANDWIDTH OPTIMIZER (zlib frames + stroke simplification)",
+              f"  sent     {kb(tr)} -> {kb(tw)}  {pct(tr, tw)}",
+              f"  received {kb(rr)} -> {kb(rw)}  {pct(rr, rw)}",
+              f"  stroke points drawn {self.pts_raw} -> sent {self.pts_sent}"
+              + (f"  ({100 * (1 - self.pts_sent / self.pts_raw):.0f} % fewer)" if self.pts_raw else "")]
         if sv:
             L += ["", "SERVER", f"  uptime {sv.get('uptime', 0)} s    clients in room {sv.get('room_clients', '?')}",
                   f"  connections total {sv.get('conns', 0)}   reconnects {sv.get('reconnects', 0)}   timeouts {sv.get('timeouts', 0)}",
@@ -1101,23 +1314,48 @@ class App(tk.Tk):
         if self.reconnecting or not hasattr(self, "canvas"):
             return
         self.reconnecting = True
-        self.status.config(text="Connection lost - reconnecting...", foreground="red")
+        self.rc_idx = 0
+        self.show_offline()
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
-    def _reconnect_loop(self):
+    def show_offline(self):
+        """Offline mode: drawing keeps working; every action waits in the outbox and is delivered,
+        once and in order, when the connection (or a standby server) is back."""
+        n = len(self.outbox)
+        self.status.config(foreground="red", text="OFFLINE - reconnecting. You can keep drawing: "
+                           + (f"{n} action(s) saved, sent automatically on reconnect" if n else "nothing waiting"))
+
+    def draw_pending(self):
+        """Show my own not-yet-confirmed objects (drawn while offline) so the board does not look empty."""
+        for req in self.outbox.values():
+            if req.get("type") == "ADD":
+                o = self.pending_plain.get(req["obj"]["id"], req["obj"])
+                if o["id"] not in self.objs:
+                    self.make_item(o["kind"], o["points"], o["color"], o["width"],
+                                   o.get("data") if o["kind"] == "image" else o.get("text"),
+                                   ("preview", "p_" + o["id"]))
+
+    def _reconnect_loop(self, wait=0.0):
+        """Try the server we were on, then every standby server we were told about, round and round."""
+        time.sleep(wait)
         while self.reconnecting:
+            targets = [(self.conn, self.use_tls)] + [((b["host"], b["port"]), bool(b.get("tls")))
+                                                      for b in self.backups]
+            conn, tls = targets[self.rc_idx % len(targets)]
             try:
                 msg = {"type": "JOIN_ROOM", "user": self.me, "room": self.room,
-                       "password": self.password, "token": self.token}
+                       "password": self.password, "token": self.token, "z": 1}
                 if self.jwt:
                     msg["jwt"] = self.jwt
-                self.net.connect(*self.conn, msg, tls=self.use_tls, check=self.check_cert_silent)
+                self.rc_target = (conn, tls)
+                self.net.connect(*conn, msg, tls=tls, check=self.check_cert_silent, timeout=2)
                 return                          # JOIN_OK (with fresh snapshot) clears the flag
             except CertRejected:
                 self.q.put({"type": "_CERT_CHANGED"})
                 return
             except OSError:
-                time.sleep(2)
+                self.rc_idx += 1
+                time.sleep(1 if len(targets) > 1 else 2)
 
     def go_offline(self, text):
         """The connection is gone for good (kicked, or the room vanished). Stop reconnecting, keep the
@@ -1143,7 +1381,629 @@ class App(tk.Tk):
         if self.jwt and self.jwt_server == (self.conn, self.use_tls):
             self.send_first({"type": "MY_ROOMS", "jwt": self.jwt})     # refresh "Your rooms"
 
+    # ------------------------------------------------------------ standby servers (failover)
+    def set_backups(self, backups):
+        """The server tells us where its standby servers are. Their TLS certificate fingerprints arrive
+        over the connection we already trust, so we can remember them now and recognise the standby
+        later without asking the user (trust is handed over, not assumed)."""
+        self.backups = [b for b in backups if b.get("host") and b.get("port")]
+        known, changed = self.load_known(), False
+        for b in self.backups:
+            key = f"{b['host']}:{b['port']}"
+            if b.get("fp") and known.get(key) != b["fp"]:
+                known[key], changed = b["fp"], True
+        if changed:
+            self.save_known(known)
+
+    # ------------------------------------------------------------ chaos lab + network map
+    def show_chaos(self, ch):
+        self.chaos = ch
+        if hasattr(self, "chaos_label"):
+            self.chaos_label.config(text=f"\u26A1 chaos: {ch['loss']:.0f}% loss, {ch['delay']:.0f}\u00B1{ch['jitter']:.0f} ms"
+                                    + (f", {ch['bw']:.0f} kbit/s" if ch.get("bw") else "") if ch else "")
+        if self.labwin and self.labwin.winfo_exists():
+            for k in ("loss", "delay", "jitter", "bw"):
+                self.lab_vars[k].set(ch.get(k, 0) if ch else 0)
+            self.draw_lab()
+
+    def open_lab(self):
+        if self.labwin and self.labwin.winfo_exists():
+            self.labwin.lift()
+            return
+        self.labwin = w = tk.Toplevel(self)
+        w.title("Chaos lab - break the network, watch it heal")
+        self.lab_map = tk.Canvas(w, width=560, height=235, bg="white", highlightthickness=1)
+        self.lab_map.pack(padx=8, pady=(8, 4))
+        host = self.me == self.host_user
+        box = ttk.LabelFrame(w, text="Emulated link between the server and every client in this room"
+                             + ("" if host else "  (only the host can change it)"), padding=6)
+        box.pack(fill="x", padx=8)
+        self.lab_vars = {}
+        for r, (k, label, top) in enumerate((("loss", "Message loss %", 60), ("delay", "Delay ms (each way)", 1000),
+                                             ("jitter", "Jitter \u00B1 ms", 500),
+                                             ("bw", "Bandwidth cap kbit/s (0 = off)", 512))):
+            v = self.lab_vars[k] = tk.DoubleVar(self, value=(self.chaos or {}).get(k, 0))
+            ttk.Label(box, text=label, width=28).grid(row=r, column=0, sticky="w")
+            sc = tk.Scale(box, from_=0, to=top, orient="horizontal", variable=v, length=300, resolution=1,
+                          state="normal" if host else "disabled")
+            sc.grid(row=r, column=1)
+            sc.bind("<ButtonRelease-1>", lambda e: self.send_chaos())
+        if host:
+            row = ttk.Frame(box)
+            row.grid(row=4, column=0, columnspan=2, pady=(6, 0), sticky="w")
+            for txt, vals in (("Off", (0, 0, 0, 0)), ("Busy Wi-Fi", (5, 80, 30, 0)), ("Bad link", (20, 200, 80, 0)),
+                              ("Terrible", (40, 400, 150, 0)), ("Narrow link", (0, 0, 0, 24))):
+                ttk.Button(row, text=txt, command=lambda vals=vals: self.send_chaos(vals)).pack(side="left", padx=2)
+            ttk.Button(row, text="Reset counters", command=lambda: self.send_chaos(reset=True)).pack(side="left", padx=8)
+        self.lab_text = tk.Text(w, width=78, height=16, font=("Courier", 10), state="disabled", bg="#f7f7f7")
+        self.lab_text.pack(padx=8, pady=8)
+        self.draw_lab()
+
+    def send_chaos(self, vals=None, reset=False):
+        if vals:
+            for k, v in zip(("loss", "delay", "jitter", "bw"), vals):
+                self.lab_vars[k].set(v)
+        self.net.send({"type": "CHAOS_SET", "reset": reset, **{k: v.get() for k, v in self.lab_vars.items()}})
+
+    def draw_lab(self):
+        """Network map (server, standby, every online client with its latency) and the repair counters."""
+        g, sv = self.lab_map, self.srv_stats
+        g.delete("all")
+        sx, sy = 280, 50
+        online = [u for u in self.users if u["online"]]
+        n = max(len(online), 1)
+        for i, u in enumerate(online):
+            x, y = 560 * (i + 1) / (n + 1), 195
+            ms = self.peers.get(u["name"])
+            good = isinstance(ms, (int, float))
+            col = "#888" if not good else "#2e7d32" if ms < 50 else "#ef6c00" if ms < 150 else "#c62828"
+            g.create_line(sx, sy + 22, x, y - 20, fill=col, width=2, dash=(6, 4) if self.chaos else None)
+            g.create_text((sx + x) / 2 + 6, (sy + y) / 2, text=f"{ms:.0f} ms" if good else "?", fill=col,
+                          anchor="w", font=("Arial", 9, "bold"))
+            web = self.kinds.get(u["name"]) == "web"
+            g.create_rectangle(x - 46, y - 20, x + 46, y + 20, fill="#fff8e1" if web else "#e3f2fd",
+                               outline=u["color"], width=3 if u["name"] == self.me else 1)
+            g.create_text(x, y - 6, text=u["name"][:14], font=("Arial", 9, "bold"))
+            g.create_text(x, y + 9, text=("browser / WebSocket" if web else "desktop / TCP")
+                          + (" (me)" if u["name"] == self.me else ""), font=("Arial", 7), fill="#555")
+        g.create_rectangle(sx - 70, sy - 22, sx + 70, sy + 22, fill="#e8f5e9", outline="#2e7d32", width=2)
+        g.create_text(sx, sy - 7, text="SERVER (primary)", font=("Arial", 9, "bold"))
+        g.create_text(sx, sy + 9, text=f"{self.conn[0]}:{self.conn[1]}  seq {sv.get('room_seq', '?')}",
+                      font=("Arial", 8), fill="#555")
+        for i, b in enumerate(self.backups[:1]):
+            bx = 480
+            g.create_line(sx + 70, sy, bx - 60, sy, fill="#6a1b9a", width=2, dash=(3, 3), arrow="last")
+            g.create_text((sx + 70 + bx - 60) / 2, sy - 9, text="replication", fill="#6a1b9a", font=("Arial", 8))
+            g.create_rectangle(bx - 60, sy - 22, bx + 60, sy + 22, fill="#f3e5f5", outline="#6a1b9a", width=2)
+            g.create_text(bx, sy - 7, text="STANDBY", font=("Arial", 9, "bold"))
+            g.create_text(bx, sy + 9, text=f"{b['host']}:{b['port']}", font=("Arial", 8), fill="#555")
+        if self.chaos:
+            g.create_text(8, 8, anchor="nw", fill="#b26a00", font=("Arial", 10, "bold"),
+                          text=f"\u26A1 CHAOS ON: {self.chaos['loss']:.0f}% loss, "
+                               f"{self.chaos['delay']:.0f} \u00B1 {self.chaos['jitter']:.0f} ms"
+                               + (f", {self.chaos['bw']:.0f} kbit/s cap" if self.chaos.get("bw") else ""))
+        srv_seq = sv.get("room_seq")
+        state = ("IN SYNC with the server" if srv_seq == self.last_seq and not self.outbox else
+                 f"catching up ({len(self.outbox)} request(s) awaiting ACK)")
+        L = ["DAMAGE DONE BY THE SERVER ON PURPOSE (this room)",
+             f"  dropped: client->server {sv.get('chaos_in', 0)}   server->client {sv.get('chaos_out', 0)}",
+             f"  requests held back until an earlier lost one arrived: {sv.get('out_of_order', 0)}",
+             "", "QUALITY OF SERVICE (board ops are always sent before cursors / live previews)",
+             f"  stale cursor/preview frames shed on slow links {sv.get('qos_shed', 0)}   "
+             f"refused by rate limit {sv.get('qos_limited', 0)}",
+             "", "HOW THIS CLIENT REPAIRED IT",
+             f"  retransmitted requests   {self.retx:5d}   (timeout now {self.rto() * 1000:.0f} ms)",
+             f"  duplicate ACKs received  {self.dup_acks:5d}   (the ACK was lost, not the request)",
+             f"  sequence-gap resyncs     {self.gaps:5d}   heartbeat resyncs {self.hb_resyncs}",
+             f"  duplicate ops ignored    {self.dup_ops:5d}",
+             "", f"RESULT: my seq {self.last_seq} / server seq {srv_seq}  ->  {state}"]
+        t = self.lab_text
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", "\n".join(L))
+        t.config(state="disabled")
+
+    # ------------------------------------------------------------ packet inspector
+    @staticmethod
+    def summarize(m):
+        t = m.get("type")
+        if t == "OP":
+            what = m["obj"]["kind"] if m.get("op") == "ADD" else f"{len(m.get('ids', []))} ids -> {'show' if m.get('visible') else 'hide'}"
+            return f"seq={m.get('seq')} {m.get('op')} {what} by {m.get('by')}"
+        if t == "ADD":
+            return f"rn={m.get('rn')} {m['obj'].get('kind')} {len(m['obj'].get('points', []))} pts"
+        if t == "ACK":
+            return f"msg_id={str(m.get('msg_id'))[:8]}" + (" DUPLICATE" if m.get("dup") else "")
+        if t == "PING":
+            return f"last rtt={m.get('rtt')}"
+        if t == "PONG":
+            return f"room seq={m.get('stats', {}).get('room_seq')}"
+        if t in ("JOIN_OK", "SNAPSHOT"):
+            snap = m.get("snapshot", m)
+            return f"snapshot seq={snap.get('seq')} {len(snap.get('objects', []))} objects"
+        if t == "OPS_SINCE":
+            return f"{len(m.get('ops', []))} missed ops"
+        if t in ("CHAT", "INFO", "ERROR"):
+            return str(m.get("text", ""))[:40]
+        if t in ("CURSOR", "LASER"):
+            return f"x={m.get('x')} y={m.get('y')}"
+        if m.get("rn"):
+            return f"rn={m['rn']}"
+        return ", ".join(k for k in m if k != "type")[:40]
+
+    def open_inspector(self):
+        if self.inspwin and self.inspwin.winfo_exists():
+            self.inspwin.lift()
+            return
+        self.inspwin = w = tk.Toplevel(self)
+        w.title("Packet inspector - every frame on this client's connection")
+        top = ttk.Frame(w)
+        top.pack(fill="x", padx=6, pady=4)
+        self.insp_opts = {k: tk.BooleanVar(self, value=v) for k, v in
+                          (("beat", True), ("mouse", True), ("pause", False))}
+        for k, txt in (("beat", "Hide PING/PONG"), ("mouse", "Hide CURSOR/LIVE/LASER"), ("pause", "Pause")):
+            ttk.Checkbutton(top, text=txt, variable=self.insp_opts[k], command=self.insp_rebuild).pack(side="left", padx=4)
+        ttk.Button(top, text="Clear", command=lambda: (self.net.trace.clear(), self.insp_rebuild())).pack(side="left", padx=8)
+        nb = ttk.Notebook(w)
+        nb.pack(fill="both", expand=True, padx=6)
+        f1 = ttk.Frame(nb)
+        nb.add(f1, text="Frames")
+        cols = (("n", "#", 50), ("time", "Time", 90), ("dir", "Direction", 110), ("type", "Type", 90),
+                ("info", "Summary", 300), ("wire", "Wire bytes", 80), ("raw", "Uncompressed", 90))
+        self.insp_tree = tr = ttk.Treeview(f1, columns=[c[0] for c in cols], show="headings", height=14)
+        for cid, title, wd in cols:
+            tr.heading(cid, text=title)
+            tr.column(cid, width=wd, anchor="w")
+        tr.tag_configure("tx", foreground="#1565c0")
+        tr.tag_configure("rx", foreground="#2e7d32")
+        tr.tag_configure("retx", foreground="#c62828")
+        sb = ttk.Scrollbar(f1, orient="vertical", command=tr.yview)
+        tr.configure(yscrollcommand=sb.set)
+        tr.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        self.insp_detail = tk.Text(f1, height=9, font=("Courier", 9), state="disabled", bg="#f7f7f7", wrap="word")
+        self.insp_detail.grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
+        f1.rowconfigure(0, weight=1)
+        f1.columnconfigure(0, weight=1)
+        tr.bind("<<TreeviewSelect>>", self.insp_select)
+        f2 = ttk.Frame(nb)
+        nb.add(f2, text="Sequence diagram")
+        self.insp_seq = tk.Canvas(f2, width=800, height=470, bg="white", highlightthickness=0)
+        self.insp_seq.pack(fill="both", expand=True)
+        self.insp_last, self.insp_rows = 0, {}
+        self.insp_tick()
+
+    def insp_wanted(self, rec):
+        t = rec[3].get("type")
+        if self.insp_opts["beat"].get() and t in ("PING", "PONG"):
+            return False
+        return not (self.insp_opts["mouse"].get() and t in ("CURSOR", "LIVE", "LASER"))
+
+    def insp_rebuild(self):
+        self.insp_tree.delete(*self.insp_tree.get_children())
+        self.insp_last, self.insp_rows = 0, {}
+        self.insp_fill()
+
+    def insp_fill(self):
+        tr, added = self.insp_tree, False
+        for rec in list(self.net.trace):
+            n, ts, d, m, wire, raw, z, retx = rec
+            if n <= self.insp_last:
+                continue
+            self.insp_last = n
+            if not self.insp_wanted(rec):
+                continue
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}"
+            arrow = ("client \u2192 server" if d == "tx" else "server \u2192 client") + (" RETX" if retx else "")
+            iid = tr.insert("", "end", values=(n, stamp, arrow, m.get("type"), self.summarize(m), wire,
+                                               f"{raw} (zlib)" if z else raw),
+                            tags=("retx" if retx or m.get("dup") else d,))
+            self.insp_rows[iid] = rec
+            added = True
+        kids = tr.get_children()
+        for iid in kids[:max(0, len(kids) - 600)]:            # keep the list short
+            tr.delete(iid)
+            self.insp_rows.pop(iid, None)
+        if added:
+            tr.see(tr.get_children()[-1])
+        return added
+
+    def insp_tick(self):
+        if not (self.inspwin and self.inspwin.winfo_exists()):
+            return
+        if not self.insp_opts["pause"].get() and self.insp_fill():
+            self.insp_draw_seq()
+        self.after(400, self.insp_tick)
+
+    def insp_select(self, _e=None):
+        sel = self.insp_tree.selection()
+        rec = self.insp_rows.get(sel[0]) if sel else None
+        if not rec:
+            return
+
+        def short(v):                                  # do not print 500 KB of image data
+            if isinstance(v, str) and len(v) > 100:
+                return v[:100] + f"... ({len(v)} chars)"
+            if isinstance(v, list) and len(v) > 12:
+                return [short(x) for x in v[:12]] + [f"... ({len(v)} items)"]
+            if isinstance(v, list):
+                return [short(x) for x in v]
+            if isinstance(v, dict):
+                return {k: short(x) for k, x in v.items()}
+            return v
+        n, ts, d, m, wire, raw, z, retx = rec
+        head = (f"frame #{n}: 4-byte length prefix + {wire - 4} byte body"
+                + (f" (zlib-compressed, {raw - 4} bytes of JSON inside; flag = top bit of the length)" if z else " (plain JSON)")
+                + (" - RETRANSMISSION" if retx else "") + "\n")
+        t = self.insp_detail
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", head + json.dumps(short(m), indent=1))
+        t.config(state="disabled")
+
+    def insp_draw_seq(self):
+        """Message sequence chart of the newest frames: client lifeline on the left, server on the right."""
+        g = self.insp_seq
+        g.delete("all")
+        recs = [r for r in self.net.trace if self.insp_wanted(r)][-20:]
+        cx, sx = 170, 650
+        for x, name in ((cx, f"Client ({self.me})"), (sx, f"Server {self.conn[0]}:{self.conn[1]}")):
+            g.create_rectangle(x - 90, 6, x + 90, 30, fill="#eceff1", outline="#607d8b")
+            g.create_text(x, 18, text=name, font=("Arial", 9, "bold"))
+            g.create_line(x, 30, x, 465, fill="#90a4ae", dash=(4, 3))
+        for i, (n, ts, d, m, wire, raw, z, retx) in enumerate(recs):
+            y = 46 + i * 21
+            col = "#c62828" if retx or m.get("dup") else "#1565c0" if d == "tx" else "#2e7d32"
+            x0, x1 = (cx, sx) if d == "tx" else (sx, cx)
+            g.create_line(x0, y, x1, y + 8, fill=col, width=2, arrow="last")
+            label = f"{m.get('type')}  {self.summarize(m)}"[:62] + (f"   [{wire} B{' z' if z else ''}]")
+            g.create_text((cx + sx) / 2, y - 3, text=("RETX " if retx else "") + label, fill=col, font=("Arial", 8))
+            g.create_text(6, y + 4, anchor="w", fill="#777", font=("Courier", 8),
+                          text=time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}")
+
+    # ------------------------------------------------------------ time-travel replay
+    def open_replay(self):
+        self.net.send({"type": "REPLAY_REQ"})          # the answer (REPLAY) opens the window
+
+    def show_replay(self, ops):
+        if self.replaywin and self.replaywin.winfo_exists():
+            self.replaywin.destroy()
+        self.replaywin = w = tk.Toplevel(self)
+        w.title(f"Time travel - room {self.room}: {len(ops)} operations from the server's op log")
+        self.rp_ops, self.rp_pos, self.rp_playing = ops, 0, False
+        self.rp_canvas = tk.Canvas(w, width=CANVAS_W, height=CANVAS_H, bg="white", highlightthickness=1)
+        self.rp_canvas.pack()
+        row = ttk.Frame(w, padding=4)
+        row.pack(fill="x")
+        self.rp_btn = ttk.Button(row, text="\u25B6 Play", width=9, command=self.rp_toggle)
+        self.rp_btn.pack(side="left")
+        self.rp_speed = tk.StringVar(self, value="8 ops/s")
+        ttk.Combobox(row, textvariable=self.rp_speed, values=["2 ops/s", "8 ops/s", "30 ops/s", "120 ops/s"],
+                     width=10, state="readonly").pack(side="left", padx=4)
+        self.rp_var = tk.IntVar(self, value=0)
+        self.rp_scale = tk.Scale(row, from_=0, to=max(len(ops), 1), orient="horizontal", variable=self.rp_var,
+                                 showvalue=False, command=lambda v: self.rp_goto(int(float(v))))
+        self.rp_scale.pack(side="left", fill="x", expand=True, padx=6)
+        self.rp_label = ttk.Label(row, text="", width=46)
+        self.rp_label.pack(side="left")
+        self.rp_goto(len(ops))                          # start at "now"; drag left or press Play to go back
+
+    def rp_goto(self, k):
+        """Show the board as it was after the first k operations. Going forward applies ops one by one
+        (exactly what a client does live); going back starts again from an empty board."""
+        if not (self.replaywin and self.replaywin.winfo_exists()):
+            return
+        c, k = self.rp_canvas, max(0, min(k, len(self.rp_ops)))
+        if k < self.rp_pos:
+            c.delete("all")
+            self.rp_pos = 0
+        for op in self.rp_ops[self.rp_pos:k]:
+            if op["op"] == "ADD":
+                o = self.reveal(op["obj"], track=False)
+                self.make_item(o["kind"], o["points"], o["color"], o["width"],
+                               o.get("data") if o["kind"] == "image" else o.get("text"),
+                               ("obj", "o_" + o["id"]), canvas=c)
+            else:
+                for i in op["ids"]:
+                    c.itemconfigure("o_" + i, state="normal" if op["visible"] else "hidden")
+        self.rp_pos = k
+        self.rp_var.set(k)
+        if k:
+            op = self.rp_ops[k - 1]
+            what = ("drew " + op["obj"]["kind"]) if op["op"] == "ADD" else \
+                   (("restored " if op["visible"] else "erased / undid ") + f"{len(op['ids'])} object(s)")
+            self.rp_label.config(text=f"op {k}/{len(self.rp_ops)}: {op.get('by', '?')} {what}")
+        else:
+            self.rp_label.config(text=f"op 0/{len(self.rp_ops)}: empty board")
+
+    def rp_toggle(self):
+        self.rp_playing = not self.rp_playing
+        if self.rp_playing:
+            if self.rp_pos >= len(self.rp_ops):
+                self.rp_goto(0)
+            self.rp_step()
+        self.rp_btn.config(text="\u23F8 Pause" if self.rp_playing else "\u25B6 Play")
+
+    def rp_step(self):
+        if not (self.rp_playing and self.replaywin and self.replaywin.winfo_exists()):
+            return
+        if self.rp_pos >= len(self.rp_ops):
+            self.rp_playing = False
+            self.rp_btn.config(text="\u25B6 Play")
+            return
+        self.rp_goto(self.rp_pos + 1)
+        self.after(int(1000 / int(self.rp_speed.get().split()[0])), self.rp_step)
+
+    # ------------------------------------------------------------ phone / browser join
+    def show_invite(self, m):
+        if not m.get("url"):
+            return messagebox.showinfo("Phone join", "The server was started with --no-web (or its web port is "
+                                                     "in use), so browsers cannot join.", parent=self)
+        if self.qrwin and self.qrwin.winfo_exists():
+            self.qrwin.destroy()
+        self.qrwin = w = tk.Toplevel(self)
+        w.title("Join from a phone or any browser")
+        ttk.Label(w, text="Scan with a phone on the same Wi-Fi / LAN - or open the link in any browser.",
+                  padding=8).pack()
+        if qrcode:
+            qr = qrcode.QRCode(border=3, error_correction=qrcode.constants.ERROR_CORRECT_L)
+            qr.add_data(m["url"])
+            qr.make(fit=True)
+            mat = qr.get_matrix()
+            px = max(3, min(8, 420 // len(mat)))
+            c = tk.Canvas(w, width=px * len(mat), height=px * len(mat), bg="white", highlightthickness=0)
+            c.pack(padx=12)
+            for y, line in enumerate(mat):
+                for x, on in enumerate(line):
+                    if on:
+                        c.create_rectangle(x * px, y * px, (x + 1) * px, (y + 1) * px, fill="black", outline="")
+        else:
+            ttk.Label(w, text="(install the 'qrcode' package to show a QR code here: pip install qrcode)",
+                      foreground="#888").pack()
+        e = ttk.Entry(w, width=70)
+        e.insert(0, m["url"])
+        e.config(state="readonly")
+        e.pack(padx=12, pady=8)
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(m["url"])
+        ttk.Button(w, text="Copy link", command=copy).pack()
+        ttk.Label(w, foreground="#666", padding=8, justify="center",
+                  text=f"The link holds a signed invite (JWT) for room {m['room']} only, valid until "
+                       f"{time.strftime('%H:%M', time.localtime(m['exp']))}.\nGuests appear as 'name (web)'. "
+                       "The browser page uses HTTP + WebSocket on the server's web port.").pack()
+
+    # ------------------------------------------------------------ end-to-end encryption
+    def reveal(self, o, track=True):
+        """An object as it should be drawn: end-to-end encrypted ones are decrypted with the room key.
+        Without the right key the object stays sealed (and is remembered, to open when a key is set)."""
+        if o.get("kind") != "enc":
+            return o
+        plain = e2e.unseal(self.e2e_keys, o.get("data", "")) if self.e2e_keys else None
+        if plain is not None:
+            try:
+                inner = json.loads(plain.decode("utf-8"))
+                if isinstance(inner, dict) and inner.get("kind") not in (None, "enc") and "points" in inner:
+                    if track:
+                        self.sealed.pop(o["id"], None)
+                    return {**inner, "id": o["id"], "owner": o.get("owner")}
+            except ValueError:
+                pass
+        if track:
+            self.sealed[o["id"]] = o
+        return o
+
+    def ask_e2e(self):
+        s = simpledialog.askstring(
+            "End-to-end key", "Passphrase for this room (everyone must type the same one; it is never sent).\n"
+            "From now on your drawings and chat are encrypted on this PC; the server relays\nand stores "
+            "only ciphertext. Leave empty to turn it off.", show="*", parent=self)
+        if s is not None:
+            self.set_e2e(s)
+
+    def set_e2e(self, passphrase):
+        self.e2e_keys = e2e.derive(passphrase, self.room) if passphrase else None
+        for oid, o in list(self.sealed.items()):          # try the new key on everything still sealed
+            plain = self.reveal(o)
+            if plain is not o and oid in self.objs:
+                self.objs[oid]["obj"] = plain
+                self.draw_obj(plain, self.objs[oid]["visible"])
+        self.e2e_btn.config(text="E2E: ON" if self.e2e_keys else "E2E key")
+        self.show_security()
+        self.add_chat("* end-to-end encryption " + ("ON: your new drawings and chat are unreadable for the server"
+                                                    if self.e2e_keys else "off"))
+
+    # ------------------------------------------------------------ peer-to-peer file transfer
+    @staticmethod
+    def download_dir():
+        if os.environ.get("WB_DOWNLOADS"):
+            return os.environ["WB_DOWNLOADS"]
+        d = os.path.join(os.path.expanduser("~"), "Downloads")
+        return os.path.join(d if os.path.isdir(d) else os.path.expanduser("~"), "whiteboard-files")
+
+    def send_file(self, path=None):
+        to = self.selected_user()
+        if not to or to == self.me:
+            return messagebox.showinfo("Send file", "Select another participant in the list first.", parent=self)
+        path = path or filedialog.askopenfilename(title=f"File to send to {to}")
+        if not path:
+            return
+        self.file_label.config(text="hashing " + os.path.basename(path) + " ...")
+
+        def prepare():                                   # hashing a big file must not freeze the window
+            try:
+                sha = p2p.sha256_file(path)
+                token = uuid.uuid4().hex
+                snd = p2p.Sender(path, token, lambda kind, a, b: self.q.put(
+                    {"type": "_FILE", "ev": "out_" + kind, "a": a, "b": b, "name": os.path.basename(path)}))
+                self.q.put({"type": "_FILE", "ev": "offer", "sender": snd, "sha": sha, "to": to, "id": token,
+                            "name": os.path.basename(path)})
+            except OSError as e:
+                self.q.put({"type": "_FILE", "ev": "error", "text": f"cannot send {path}: {e}"})
+        threading.Thread(target=prepare, daemon=True).start()
+
+    def file_offered(self, m):
+        mb = m["size"] / 1e6
+        if not messagebox.askyesno("Incoming file", f"{m['from']} wants to send you:\n\n{m['name']}  ({mb:.2f} MB)\n\n"
+                                   f"It comes directly from {m['from']}'s PC (peer to peer) and is saved in\n"
+                                   f"{self.download_dir()}\n\nAccept?", parent=self):
+            return self.net.send({"type": "FILE_REPLY", "to": m["from"], "id": m["id"], "status": "declined"})
+        host = self.conn[0] if is_loopback(m["ip"]) else m["ip"]   # sender sits on the server PC: use its LAN address
+        self.net.send({"type": "FILE_REPLY", "to": m["from"], "id": m["id"], "status": "accepted"})
+        self.add_chat(f"* receiving {m['name']} directly from {m['from']} ({host}:{m['port']}) ...")
+
+        def work():
+            t0, last = time.time(), [0.0]
+
+            def progress(got, size):
+                if time.time() - last[0] > 0.2 or got == size:
+                    last[0] = time.time()
+                    self.q.put({"type": "_FILE", "ev": "in_progress", "a": got, "b": size, "name": m["name"]})
+            try:
+                path = p2p.fetch(host, m["port"], m["id"], m["name"], m["size"], m["sha"], self.download_dir(), progress)
+                secs = max(time.time() - t0, 0.001)
+                self.q.put({"type": "_FILE", "ev": "received", "path": path, "m": m,
+                            "text": f"{m['name']}, {mb:.2f} MB at {mb / secs:.1f} MB/s, SHA-256 verified"})
+            except (OSError, ValueError) as e:
+                self.q.put({"type": "_FILE", "ev": "failed", "m": m, "text": str(e)})
+        threading.Thread(target=work, daemon=True).start()
+
+    def file_reply(self, m):
+        st = m.get("status")
+        if st == "declined":
+            self.add_chat(f"* {m['from']} declined the file")
+        elif st == "failed":
+            self.add_chat(f"! file transfer to {m['from']} failed: {m.get('text')} - send it again to resume")
+        if st in ("declined", "received"):
+            snd = self.file_out.pop(m.get("id"), None)
+            if snd:
+                snd.close()
+            self.file_label.config(text="")
+
+    def file_event(self, m):
+        ev = m["ev"]
+        if ev == "offer":
+            self.file_out[m["id"]] = snd = m["sender"]
+            self.net.send({"type": "FILE_OFFER", "to": m["to"], "id": m["id"], "name": m["name"], "size": snd.size,
+                           "sha": m["sha"], "port": snd.port})
+            self.file_label.config(text=f"offered {m['name']} to {m['to']}")
+            self.add_chat(f"* offering {m['name']} ({snd.size / 1e6:.2f} MB) to {m['to']} - it will go directly "
+                          f"from this PC (TCP port {snd.port}), not through the server")
+        elif ev in ("in_progress", "out_progress"):
+            self.file_label.config(text=f"{'receiving' if ev[0] == 'i' else 'sending'} {m['name'][:18]} "
+                                        f"{100 * m['a'] // max(m['b'], 1)}%")
+        elif ev == "received":
+            self.file_label.config(text="")
+            self.add_chat(f"* file saved: {m['path']} ({m['text']})")
+            self.net.send({"type": "FILE_REPLY", "to": m["m"]["from"], "id": m["m"]["id"], "status": "received",
+                           "text": m["text"]})
+        elif ev == "failed":
+            self.file_label.config(text="")
+            self.add_chat(f"! file transfer failed: {m['text']}")
+            self.net.send({"type": "FILE_REPLY", "to": m["m"]["from"], "id": m["m"]["id"], "status": "failed",
+                           "text": m["text"]})
+        elif ev == "error":
+            self.file_label.config(text="")
+            self.add_chat("! " + m["text"])
+
+    # ------------------------------------------------------------ voice chat (UDP)
+    def start_voice(self):
+        """(Re)connect the voice client to the server we are on now."""
+        talking = self.vc.talking if self.vc else False
+        self.close_voice()
+        self.vc = voice.VoiceClient(self.conn[0], self.voice_port, self.room, self.me, self.token)
+        self.vc.talking = talking
+        try:
+            self.audio = voice.AudioIO(self.vc)
+            self.voice_err = ""
+        except Exception as e:                          # no package, no microphone, no sound card ...
+            self.audio, self.voice_err = None, str(e)
+
+    def close_voice(self):
+        if getattr(self, "audio", None):
+            self.audio.close()
+        if getattr(self, "vc", None):
+            self.vc.close()
+        self.audio = self.vc = None
+
+    def open_voice(self):
+        if not self.voice_port:
+            return messagebox.showinfo("Voice", "The server's voice relay is off (--no-voice or UDP port in use).",
+                                       parent=self)
+        if self.voicewin and self.voicewin.winfo_exists():
+            return self.voicewin.lift()
+        self.start_voice()
+        self.voicewin = w = tk.Toplevel(self)
+        w.title("Voice chat (UDP)")
+        btn = tk.Button(w, text="Hold to talk", width=28, height=2, bg="#e3f2fd")
+        btn.pack(padx=12, pady=(12, 4))
+
+        def talk(on):
+            if self.vc:
+                self.vc.talking = on or self.voice_free.get()
+            btn.config(bg="#ffcdd2" if on else "#e3f2fd", text="Talking ..." if on else "Hold to talk")
+        btn.bind("<ButtonPress-1>", lambda e: talk(True))
+        btn.bind("<ButtonRelease-1>", lambda e: talk(False))
+        self.voice_free = tk.BooleanVar(self, value=False)
+        ttk.Checkbutton(w, text="Hands-free (microphone stays open)", variable=self.voice_free,
+                        command=lambda: talk(False)).pack()
+        self.voice_text = tk.Text(w, width=58, height=9, font=("Courier", 10), state="disabled", bg="#f7f7f7")
+        self.voice_text.pack(padx=12, pady=10)
+
+        def closed():
+            self.close_voice()
+            w.destroy()
+        w.protocol("WM_DELETE_WINDOW", closed)
+        self.voice_tick()
+
+    def voice_tick(self):
+        if not (self.voicewin and self.voicewin.winfo_exists() and self.vc):
+            return
+        s = self.vc.stats()
+        L = [f"relay    {self.conn[0]} UDP {self.voice_port}: " + ("registered" if s["connected"] else "not registered yet"),
+             "audio    " + ("microphone + speaker on" if self.audio else "NO AUDIO DEVICE: " + self.voice_err[:60]),
+             "codec    G.711 mu-law, 8 kHz, 20 ms packets (64 kbit/s)",
+             f"sent     {s['sent']} packets",
+             f"received {s['received']} packets   lost {s['lost']} ({s['loss_pct']:.1f} %)   late {s['late']}",
+             f"jitter   {s['jitter']:.1f} ms   (playout delay 60 ms)",
+             "speaking " + (", ".join(s["speakers"]) or "-"),
+             "", "A lost packet is 20 ms of silence - the voice never waits (try the Chaos lab)."]
+        t = self.voice_text
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", "\n".join(L))
+        t.config(state="disabled")
+        self.after(500, self.voice_tick)
+
+    # ------------------------------------------------------------ connection diagnostics
+    def open_diagnose(self):
+        try:
+            conn, tls, _ = self.target()
+        except ValueError:
+            return messagebox.showerror("Diagnose", "The port must be a number")
+        w = tk.Toplevel(self)
+        w.title(f"Diagnose connection to {conn[0]}:{conn[1]}")
+        self.diag_text = t = tk.Text(w, width=110, height=24, font=("Courier", 10), bg="#f7f7f7")
+        t.pack(padx=8, pady=8)
+        for tag, col in (("ok", "#2e7d32"), ("warn", "#b26a00"), ("bad", "#c62828"), ("info", "#555")):
+            t.tag_configure(tag, foreground=col)
+        t.insert("end", "Checking, layer by layer (the route check at the end can take half a minute) ...\n\n", "info")
+        emit = lambda v, n, text: self.q.put({"type": "_DIAG", "v": v, "n": n, "text": text})
+        threading.Thread(target=lambda: diagnose.run(conn[0], conn[1], tls, emit), daemon=True).start()
+
+    def diag_line(self, m):
+        t = getattr(self, "diag_text", None)
+        if t is None or not t.winfo_exists():
+            return
+        mark = {"ok": "[ OK ]", "warn": "[WARN]", "bad": "[FAIL]", "info": "      "}[m["v"]]
+        t.insert("end", f"{mark} {m['n']:<10} {m['text']}\n", m["v"])
+        t.see("end")
+
     def on_close(self):
+        self.close_voice()
+        for snd in self.file_out.values():
+            snd.close()
         self.net.close()
         self.destroy()
 
