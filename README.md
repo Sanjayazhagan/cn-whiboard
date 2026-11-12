@@ -284,8 +284,8 @@ file on both systems. Pushing a tag such as `v1.0`, or running the workflow by h
 - Windows: `whiteboard-server.exe`, `whiteboard-client.exe`. The files are not code-signed, so SmartScreen may say
   "Windows protected your PC": click *More info* -> *Run anyway*. On the first server start, allow it through the
   firewall on *Private networks*, or other PCs cannot connect.
-- Linux: unpack `whiteboard-linux.tar.gz`, then `./whiteboard-server` and `./whiteboard-client` (voice chat also needs
-  `sudo apt install libportaudio2`).
+- Linux: unpack `whiteboard-linux.tar.gz`, then `./whiteboard-server` and `./whiteboard-client` (the client carries its
+  own PortAudio for voice chat; running from source needs `sudo apt install libportaudio2`).
 The server keeps `whiteboard.db` and its certificate in the folder it is started from.
 - Install `cryptography` before building (`pip install -r requirements.txt`) so the server .exe can create its certificate.
   Keep `server_cert.pem` / `server_key.pem` / `whiteboard.db` next to the .exe between runs; deleting the certificate makes every

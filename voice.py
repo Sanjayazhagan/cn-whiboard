@@ -27,10 +27,14 @@ RFC 3550:  J = J + (|D| - J) / 16.
 Limit: voice is not encrypted, and browser guests have no voice (a web page cannot open UDP sockets).
 Needs the optional `sounddevice` package for the microphone and speaker.
 """
+import ctypes.util
+import glob
 import json
+import os
 import random
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -42,10 +46,37 @@ RATE, FRAME = 8000, 160                 # 20 ms
 PREBUFFER = 3                           # packets held before playout starts (60 ms)
 SILENCE = b"\x00\x00" * FRAME
 
+
+def bundled_portaudio():
+    """The PortAudio library packed into a PyInstaller build (Linux: libportaudio.so.2), or None."""
+    base = getattr(sys, "_MEIPASS", None)
+    if not getattr(sys, "frozen", False) or not base:
+        return None
+    libs = sorted(glob.glob(os.path.join(base, "libportaudio.so*")))
+    return libs[0] if libs else None
+
+
+def load_sounddevice():
+    """sounddevice finds PortAudio with ctypes.util.find_library("portaudio"), which only looks at the system
+    libraries and only for the unversioned libportaudio.so. The Linux executable carries its own
+    libportaudio.so.2, so without help voice only worked on PCs that had libportaudio2 installed anyway."""
+    lib = bundled_portaudio()
+    if lib is None:
+        import sounddevice
+        return sounddevice
+    find = ctypes.util.find_library
+    ctypes.util.find_library = lambda name: find(name) or (lib if name == "portaudio" else None)
+    try:
+        import sounddevice
+    finally:
+        ctypes.util.find_library = find
+    return sounddevice
+
+
 try:
-    import sounddevice
-except (ImportError, OSError):          # OSError: the PortAudio library is missing
-    sounddevice = None
+    sounddevice, SOUND_ERR = load_sounddevice(), ""
+except (ImportError, OSError) as e:     # OSError: the PortAudio library is missing
+    sounddevice, SOUND_ERR = None, str(e)
 
 
 # ---------------------------------------------------------------- G.711 mu-law (tables built once)
@@ -294,8 +325,8 @@ class AudioIO:
     """Microphone and loudspeaker through the optional `sounddevice` package (PortAudio)."""
     def __init__(self, client):
         if sounddevice is None:
-            raise RuntimeError("the 'sounddevice' package is not installed (pip install sounddevice; "
-                               "Linux also needs: sudo apt install libportaudio2)")
+            raise RuntimeError(f"no sound support ({SOUND_ERR}); pip install sounddevice, "
+                               "Linux also needs: sudo apt install libportaudio2")
         self.c = client
 
         def mic(indata, frames, t, status):
