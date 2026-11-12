@@ -20,7 +20,10 @@ Python 3.9+ (`pip install -r requirements.txt`: Pillow for PNG export and JPEG i
 
 ## Features
 **Select tool (move objects)**: pick **Select**, press on any image, shape, stroke, text or sticky note and drag it; it moves
-for everyone when you let go (dashed blue frame while dragging; Ctrl+Z moves it back). Freehand pen, object eraser, line/rectangle/oval/text, colour + width, live remote strokes and cursors in each user's colour,
+for everyone when you let go (dashed blue frame while dragging; Ctrl+Z moves it back). To move several things at once: drag over
+empty board to draw a selection rectangle (everything it touches is selected), **Shift+click** to add or remove one object, or press
+**All** / **Ctrl+A** to select everything; then drag any selected object and the whole selection moves together as one step
+(one undo puts it all back). **Esc** or a click on empty board clears the selection. Freehand pen, object eraser, line/rectangle/oval/text, colour + width, live remote strokes and cursors in each user's colour,
 participant list with online status, group chat with timestamps, per-user undo/redo (Ctrl+Z / Ctrl+Y),
 host-only Clear / Save / Restore (saved to `saves/<room>.json` on the server), host can switch users between editor/viewer or kick,
 room password, **LAN server discovery (UDP broadcast)**, **sticky notes**, **image insertion** (PNG/GIF; JPEG/BMP need Pillow; resized to <=400px), **PNG export**, **version history**, automatic reconnect (same username + token) with full state recovery, and actions made while the
@@ -46,9 +49,13 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
 - **Phone join** (desktop client) shows a **QR code** and link. The link carries a signed **invite JWT** for that one room, valid 1 hour;
   the guest only types a name and appears as `name (web)`. No account password ever travels over the plain-HTTP page.
   Without an invite, `http://SERVER-IP:8080/` asks for name, account password and room code.
-- The page has select (drag to move), pen, eraser, line, rect, oval, text, sticky, laser, colour, width, undo/redo, chat, live cursors, latency, and the same
+- The page has select (drag to move; **All** or a selection rectangle to move many), pen, eraser, line, rect, oval, text, sticky, laser, colour, width, undo/redo, chat, live cursors, latency, and the same
   reliability rules (ACK + retransmit timer, seq-gap resync, auto reconnect, failover).
-- Firewall: also allow TCP 8080 (`sudo ufw allow 8080/tcp`). Limits (say so in the report): the page is HTTP, not HTTPS (a phone would
+- **If port 8080 is already used by another program** on the host PC (for example the web server that EDB Postgres installs,
+  which shows "Server is up and running"), the whiteboard does not share or fight for it: it moves its browser listener to the next
+  free port (8081, 8082, ...), says so in the server window, and the **Phone join** QR code / link already carries that port.
+  A link or QR code made before a server restart may still point at the old port: open **Phone join** again for a fresh one.
+- Firewall: also allow TCP 8080 (`sudo ufw allow 8080/tcp`), or the port the server printed. Limits (say so in the report): the page is HTTP, not HTTPS (a phone would
   reject the self-signed certificate), so browser traffic is readable on the LAN; browsers cannot insert images.
 
 ### 2. Chaos lab (emulated bad network, like `tc netem`, inside the app)

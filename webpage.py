@@ -63,7 +63,8 @@ let ws = null, joined = false, dead = false, me = "", room = "", role = "editor"
 let users = [], objs = new Map(), lastSeq = 0, resyncing = false, resyncAt = 0, seqAtPong = -1;
 let outbox = [], rn = 0, rto = 800, tries = 0, rtt = null, rtts = [];
 let tool = "pen", color = "#000000", width = 3, cur = null, live = {}, cursors = {}, lasers = {}, imgs = {};
-let drag = null, nudge = {};     // select tool: object being dragged; my moves not yet ACKed (id -> offset)
+let drag = null, nudge = {};     // select tool: objects being dragged {ids, x0, y0, dx, dy}; my moves not yet ACKed (id -> offset)
+let sel = new Set(), band = null;  // select tool: selected object ids; selection rectangle being dragged over empty board
 let hosts = [location.host], hostIdx = 0, opened = false, dirty = true, lastLive = 0, lastCur = 0, erased = new Set();
 const uid = () => Array.from({length: 4}, () => Math.random().toString(16).slice(2, 10)).join("");
 const now = () => Date.now();
@@ -179,8 +180,8 @@ function applyOp(op) {
   if (op.op === "ADD") { objs.set(op.obj.id, {obj: op.obj, visible: true}); delete live[op.by]; if (op.by === me) pending = pending.filter(p => p.id !== op.obj.id); }
   else if (op.op === "MOVE") op.ids.forEach(i => { const r = objs.get(i); if (r) r.obj = moved(r.obj, op.dx, op.dy);
     if (nudge[i] && nudge[i].mid === op.msg_id) delete nudge[i];            // my own move arrived: drop the preview
-    if (drag && drag.id === i && op.by !== me) drag = null; });
-  else op.ids.forEach(i => { const r = objs.get(i); if (r) r.visible = op.visible; erased.delete(i); });
+    if (drag && drag.ids.includes(i) && op.by !== me) drag = null; });
+  else op.ids.forEach(i => { const r = objs.get(i); if (r) r.visible = op.visible; erased.delete(i); if (!op.visible) sel.delete(i); });
   dirty = true;
 }
 let pending = [];                                         // my own objects not yet confirmed (drawn at once)
@@ -211,10 +212,13 @@ function frame() {
   for (const u in lasers) { lasers[u] = lasers[u].filter(q => t - q.t < 900); if (lasers[u].length) anim = true; else delete lasers[u]; }
   if (!dirty && !anim) return; dirty = false;
   g.clearRect(0, 0, W, H);
-  objs.forEach((r, id) => { if (!r.visible) return; const n = drag && drag.id === id ? drag : nudge[id];
-    shape(n ? moved(r.obj, n.dx, n.dy) : r.obj); });
-  if (drag) { const r = objs.get(drag.id), b = r && box(r.obj); if (b) { g.save(); g.strokeStyle = "#1e88e5"; g.lineWidth = 1; g.setLineDash([4, 3]);
-    g.strokeRect(b[0] + drag.dx - 3, b[1] + drag.dy - 3, b[2] - b[0] + 6, b[3] - b[1] + 6); g.restore(); } }
+  const off = id => drag && drag.ids.includes(id) ? drag : nudge[id];       // preview offset of an object, if any
+  objs.forEach((r, id) => { if (!r.visible) return; const n = off(id); shape(n ? moved(r.obj, n.dx, n.dy) : r.obj); });
+  if (sel.size || band) { g.save(); g.strokeStyle = "#1e88e5"; g.lineWidth = 1; g.setLineDash([4, 3]);
+    sel.forEach(id => { const r = objs.get(id); if (!r || !r.visible) return; const b = box(r.obj), n = off(id) || {dx: 0, dy: 0};
+      g.strokeRect(b[0] + n.dx - 3, b[1] + n.dy - 3, b[2] - b[0] + 6, b[3] - b[1] + 6); });
+    if (band) { g.setLineDash([2, 2]); g.strokeRect(band.x0, band.y0, band.x1 - band.x0, band.y1 - band.y0); }
+    g.restore(); }
   pending.forEach(shape);
   for (const u in live) { const m = live[u]; if (m.points.length > 1) shape({kind: "stroke", points: m.points, color: m.color, width: m.width}); }
   if (cur) shape(cur);
@@ -255,6 +259,10 @@ function box(o) {                                         // bounding box [x0, y
   const xs = p.map(q => q[0]), ys = p.map(q => q[1]), r = o.width / 2;
   return [Math.min(...xs) - r, Math.min(...ys) - r, Math.max(...xs) + r, Math.max(...ys) + r];
 }
+function objectsIn(x0, y0, x1, y1) {                      // ids of the visible objects whose box touches the rectangle
+  const ids = []; objs.forEach((r, id) => { if (!r.visible || r.obj.kind === "enc") return; const b = box(r.obj);
+    if (b[0] <= Math.max(x0, x1) && b[2] >= Math.min(x0, x1) && b[1] <= Math.max(y0, y1) && b[3] >= Math.min(y0, y1)) ids.push(id); }); return ids; }
+function selectAll() { if (role !== "editor") return; setTool("select"); sel = new Set(objectsIn(-1e6, -1e6, 1e6, 1e6)); dirty = true; }
 function objectAt(x, y) { let found = null; objs.forEach((r, id) => { if (r.visible && hit(r.obj, x, y, 4)) found = id; }); return found; }   // topmost = last drawn
 function eraseAt(x, y) {
   const ids = []; objs.forEach((r, id) => { if (r.visible && !erased.has(id) && hit(r.obj, x, y, 5 + width)) ids.push(id); });
@@ -267,7 +275,11 @@ cv.addEventListener("pointerdown", e => {
   cv._down = true;
   if (tool === "text" || tool === "sticky") { cv._down = false; const s = prompt(tool === "text" ? "Enter text:" : "Note text:"); if (s) add({kind: tool, color: color, width: width, points: [[x, y]], text: s.slice(0, tool === "text" ? 500 : 300)}); }
   else if (tool === "eraser") eraseAt(x, y);
-  else if (tool === "select") { cur = null; const id = objectAt(x, y); drag = id ? {id: id, x0: x, y0: y, dx: 0, dy: 0} : null; }
+  else if (tool === "select") { cur = null; drag = band = null; const id = objectAt(x, y);
+    // object: select it (Shift adds / removes) and drag the whole selection; empty board: selection rectangle
+    if (!id) { if (!e.shiftKey) sel.clear(); band = {x0: x, y0: y, x1: x, y1: y}; }
+    else { if (e.shiftKey) { sel.has(id) ? sel.delete(id) : sel.add(id); } else if (!sel.has(id)) sel = new Set([id]);
+      if (sel.has(id)) drag = {ids: Array.from(objs.keys()).filter(i => sel.has(i) && objs.get(i).visible), x0: x, y0: y, dx: 0, dy: 0}; } }
   else cur = {kind: tool === "pen" ? "stroke" : tool, color: color, width: width, points: tool === "pen" ? [[x, y]] : [[x, y], [x, y]]};
   dirty = true;
 });
@@ -278,6 +290,7 @@ cv.addEventListener("pointermove", e => {
   if (tool === "laser") return laser(x, y);
   if (tool === "eraser") return eraseAt(x, y);
   if (drag) { drag.dx = x - drag.x0; drag.dy = y - drag.y0; dirty = true; return; }
+  if (band) { band.x1 = x; band.y1 = y; dirty = true; return; }
   if (!cur) return;
   if (cur.kind === "stroke") { const l = cur.points[cur.points.length - 1]; if (Math.abs(x - l[0]) + Math.abs(y - l[1]) < 2) return; cur.points.push([x, y]);
     if (t - lastLive > 40) { lastLive = t; raw({type: "LIVE", color: color, width: width, points: cur.points.slice(-50)}); } }
@@ -285,16 +298,26 @@ cv.addEventListener("pointermove", e => {
   dirty = true;
 });
 function up() { cv._down = false;
+  if (band) { const b = band; band = null; dirty = true;
+    if (Math.abs(b.x1 - b.x0) > 2 || Math.abs(b.y1 - b.y0) > 2) objectsIn(b.x0, b.y0, b.x1, b.y1).forEach(i => sel.add(i)); return; }
   if (drag) { const d = drag; drag = null; dirty = true;
-    if (d.dx || d.dy) { const m = {type: "MOVE", ids: [d.id], dx: d.dx, dy: d.dy}; rel(m); nudge[d.id] = {dx: d.dx, dy: d.dy, mid: m.msg_id}; } return; }
+    if (d.dx || d.dy) for (let k = 0; k < d.ids.length; k += 500) {          // the server takes at most 500 ids per MOVE
+      const ids = d.ids.slice(k, k + 500), m = {type: "MOVE", ids: ids, dx: d.dx, dy: d.dy}; rel(m);
+      ids.forEach(i => { nudge[i] = {dx: d.dx, dy: d.dy, mid: m.msg_id}; }); } return; }
   if (!cur) return; const o = cur; cur = null; if (o.kind === "stroke") o.points = rdp(o.points, 1.0); add(o); }
 cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
 function laser(x, y) { (lasers[me] = lasers[me] || []).push({x: x, y: y, t: now()}); raw({type: "LASER", x: x, y: y}); dirty = true; }
 
 // ---------------------------------------------------------------- toolbar
 const bar = $("bar"), tools = ["select", "pen", "eraser", "line", "rect", "oval", "text", "sticky", "laser"];
+function setTool(t) { if (t !== tool) { sel.clear(); drag = band = null; } tool = t; dirty = true;
+  bar.querySelectorAll("button[data-t]").forEach(x => x.className = x.dataset.t === t ? "on" : ""); }
 tools.forEach(t => { const b = document.createElement("button"); b.textContent = t[0].toUpperCase() + t.slice(1); b.dataset.t = t; if (t === tool) b.className = "on";
-  b.onclick = () => { tool = t; bar.querySelectorAll("button[data-t]").forEach(x => x.className = x.dataset.t === t ? "on" : ""); }; bar.appendChild(b); });
+  b.onclick = () => setTool(t); bar.appendChild(b);
+  if (t === "select") { const a = document.createElement("button"); a.textContent = "All"; a.title = "Select everything on the board, then drag to move it all"; a.onclick = selectAll; bar.appendChild(a); } });
+document.addEventListener("keydown", e => { if (!joined || /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") { e.preventDefault(); selectAll(); }
+  else if (e.key === "Escape") { sel.clear(); dirty = true; } });
 const col = document.createElement("input"); col.type = "color"; col.value = color; col.setAttribute("aria-label", "Colour"); col.oninput = () => { color = col.value; }; bar.appendChild(col);
 const wid = document.createElement("input"); wid.type = "range"; wid.min = 1; wid.max = 20; wid.value = 3; wid.setAttribute("aria-label", "Line width"); wid.oninput = () => { width = +wid.value; }; bar.appendChild(wid);
 [["Undo", () => rel({type: "UNDO"})], ["Redo", () => rel({type: "REDO"})], ["Chat", () => { const c = $("chat"); c.style.display = c.style.display === "flex" ? "none" : "flex"; }]]
