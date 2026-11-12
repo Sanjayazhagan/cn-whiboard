@@ -136,6 +136,8 @@ def run(host, port=DEFAULT_PORT, tls=True, emit=print, web_port=WEB_PORT, discov
                 try:
                     reply = recv_msg(s)
                     st = reply.get("stats", {})
+                    if isinstance(reply.get("web"), int):       # the server says which web port it really uses
+                        web_port = reply["web"]                 # (it moves on when 8080 is taken by another program)
                     out(OK, "protocol", f"PING -> {reply.get('type')} in {(time.time() - t0) * 1000:.0f} ms; server up "
                                         f"{st.get('uptime', '?')} s, {st.get('conns', '?')} connections so far")
                 except (OSError, ValueError):
@@ -154,7 +156,9 @@ def run(host, port=DEFAULT_PORT, tls=True, emit=print, web_port=WEB_PORT, discov
             info = json.loads(body)
             out(OK, f"web {web_port}", f"HTTP 200, server '{info.get('name')}' role {info.get('role')}: phones can join")
         except (OSError, ValueError):
-            out(WARN, f"web {web_port}", "port is open but it is not the whiteboard's web server")
+            out(WARN, f"web {web_port}", "port is open but ANOTHER program answers there, not the whiteboard: "
+                                         "phones would see that program's page. Restart the server (it then picks a "
+                                         "free web port by itself) or start it with --web-port <other number>")
         finally:
             w.close()
     else:

@@ -562,7 +562,7 @@ def handle(client, msg):
     room, t = client.room, msg.get("type")
     if t == "PING":
         # Echo the client's timestamp so it can compute RTT; piggyback live server/room statistics.
-        reply = {"type": "PONG", "t": msg.get("t"), "stats": stats.snapshot()}
+        reply = {"type": "PONG", "t": msg.get("t"), "stats": stats.snapshot(), "web": WEB}
         if room is not None:
             with room.lock:
                 if client.user in room.members:
@@ -1305,6 +1305,48 @@ def restore_rooms():
     return len(rooms), n_ops
 
 
+WEB_PORT_TRIES = 10       # the web listener tries this many ports, starting at --web-port
+
+
+def web_is_ours(port, token):
+    """Ask the web port for /info and check that the answer comes from THIS process. If another program
+    answers there (two listeners on one port, possible on Windows), phones would get its page, not ours."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
+            s.settimeout(2)
+            s.sendall(b"GET /info HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            data = b""
+            while len(data) < 8192:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        return json.loads(data.split(b"\r\n\r\n", 1)[1]).get("id") == token
+    except (OSError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def start_web(host, first_port, name):
+    """Start the HTTP + WebSocket listener on the first usable port from `first_port` on.
+    A port is skipped when another program already listens on it, or when a request to it is not
+    answered by us. Returns the port, or None if none of them could be used."""
+    token = secrets.token_hex(8)
+    info = lambda: {"name": name, "auth": AUTH, "role": ROLE, "id": token}
+    loop_host = host if host not in ("0.0.0.0", "", "::") else None
+    for port in range(first_port, first_port + WEB_PORT_TRIES):
+        try:
+            srv = web.start(host, port, lambda: PAGE.encode("utf-8"), info, serve_websocket, TIMEOUT_SEC,
+                            extra=web_extra)
+        except OSError as e:
+            event(f"[!] Web port {port} not available ({e})", flush=True)
+            continue
+        if loop_host is not None or web_is_ours(port, token):    # (bound to one address: cannot ask via loopback)
+            return port
+        event(f"[!] Web port {port}: another program answers there", flush=True)
+        srv.close()
+    return None
+
+
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -1447,7 +1489,11 @@ def main():
             event(f"[!] TLS OFF - {e}", flush=True)
     else:
         print("TLS: OFF (--no-tls) - traffic is readable on the network", flush=True)
-    srv, v6 = listen_socket(a.host, a.port)
+    try:
+        srv, v6 = listen_socket(a.host, a.port)
+    except OSError as e:
+        raise SystemExit(f"Cannot listen on TCP port {a.port}: {e}.\n"
+                         f"Another program (or a second whiteboard server) uses it; start with --port <other number>.")
     srv.listen(50)
     print(f"Whiteboard server '{a.name}' listening on {lan_ip()}:{a.port}  (clients connect to this address)")
     if v6:
@@ -1457,16 +1503,19 @@ def main():
     else:
         print("IPv6: not available on this machine - serving IPv4 only", flush=True)
     if not a.no_web:
-        try:
-            web.start(a.host, a.web_port, lambda: PAGE.encode("utf-8"),
-                      lambda: {"name": a.name, "auth": AUTH, "role": ROLE}, serve_websocket, TIMEOUT_SEC,
-                      extra=web_extra)
-            WEB = a.web_port
-            print(f"Admin dashboard: http://{lan_ip()}:{a.web_port}/admin?key={ADMIN_KEY}", flush=True)
-            print(f"Browser clients (HTTP + WebSocket): http://{lan_ip()}:{a.web_port}/  "
+        port = start_web(a.host, a.web_port, a.name)
+        if port is None:
+            event(f"[!] Browser listener disabled: ports {a.web_port}-{a.web_port + WEB_PORT_TRIES - 1} are all "
+                  "used by other programs; choose one with --web-port", flush=True)
+        else:
+            WEB = port
+            if port != a.web_port:
+                event(f"[!] Port {a.web_port} is used by another program on this PC, so browsers/phones use port "
+                      f"{port} instead (the 'Phone join' QR code already points there; allow TCP {port} in the firewall)",
+                      flush=True)
+            print(f"Admin dashboard: http://{lan_ip()}:{port}/admin?key={ADMIN_KEY}", flush=True)
+            print(f"Browser clients (HTTP + WebSocket): http://{lan_ip()}:{port}/  "
                   "(or use 'Phone join' in the desktop client for a QR code)", flush=True)
-        except OSError as e:
-            event(f"[!] Browser listener disabled (port {a.web_port}: {e}); try --web-port", flush=True)
     if not a.no_voice:
         try:
             voice.Relay(a.host, a.voice_port, voice_auth, voice_loss,
