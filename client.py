@@ -42,6 +42,7 @@ import voice
 from auth import fingerprint
 
 CANVAS_W, CANVAS_H = 1000, 640
+MOVE_MAX_IDS = 500        # most object ids the server accepts in one MOVE request
 DEFAULT_TLS = True        # "Encrypted connection" ticked by default (discovery sets it per server)
 # fingerprints of servers seen before (trust on first use); override with WB_KNOWN_SERVERS for tests
 KNOWN_SERVERS = os.environ.get("WB_KNOWN_SERVERS") or os.path.join(os.path.expanduser("~"),
@@ -278,7 +279,9 @@ class App(tk.Tk):
         self.photos, self.hist = {}, None   # image cache (Tk drops unreferenced images), history window
         self.tool, self.color, self.width = "pen", "#000000", 3
         self.cur, self.cur_pts, self.last_live, self.last_cursor = None, [], 0, 0
-        self.drag = None          # select tool: {"id", "x0", "y0", "dx", "dy"} while an object is being dragged
+        self.drag = None          # select tool: {"ids", "x0", "y0", "dx", "dy"} while the selection is being dragged
+        self.sel = set()          # select tool: ids of the selected objects (dashed frames)
+        self.band = None          # select tool: (x0, y0) while a selection rectangle is dragged over empty board
         self.moves = {}           # msg_id of my MOVE -> ids, redrawn from the server's state once ACKed
 
     # ------------------------------------------------------------ login screen
@@ -514,6 +517,8 @@ class App(tk.Tk):
         for t in ("select", "pen", "eraser", "line", "rect", "oval", "text", "sticky", "image", "laser"):
             ttk.Radiobutton(bar, text=t.title(), value=t, variable=self.tool_var,
                             command=self.set_tool).pack(side="left", padx=2)
+            if t == "select":                       # select everything, then drag any object to move the lot
+                ttk.Button(bar, text="All", width=4, command=lambda: self.select_all(button=True)).pack(side="left")
         self.color_btn = tk.Button(bar, text="  Color  ", bg=self.color, fg="white", command=self.pick_color)
         self.color_btn.pack(side="left", padx=6)
         self.width_var = tk.IntVar(self, value=3)
@@ -586,6 +591,8 @@ class App(tk.Tk):
         self.after(200, self.rto_tick, self.tick_gen)
         self.bind("<Control-z>", lambda e: self.send_reliable({"type": "UNDO"}))
         self.bind("<Control-y>", lambda e: self.send_reliable({"type": "REDO"}))
+        self.bind("<Control-a>", self.select_all)
+        self.bind("<Escape>", self.select_none)
 
     def send_reliable(self, msg):
         """Send a request that must not be lost: it keeps a msg_id and stays in the outbox until ACKed.
@@ -813,7 +820,9 @@ class App(tk.Tk):
     def set_tool(self):
         self.tool = self.tool_var.get()
         self.canvas.config(cursor="fleur" if self.tool == "select" else "")
-        self.canvas.delete("sel")
+        self.sel.clear()
+        self.drag = self.band = None
+        self.canvas.delete("sel", "band")
 
     def can_draw(self):
         return self.role == "editor" and not self.offline
@@ -860,9 +869,9 @@ class App(tk.Tk):
                 self.last_live = time.time()
                 self.laser_at(e.x, e.y)
             return
-        if self.tool == "select" and self.drag:
+        if self.tool == "select" and (self.drag or self.band):
             self.on_move(e)
-            return self.drag_to(e)
+            return self.drag_to(e) if self.drag else self.band_to(e)
         if not self.can_draw() or not self.cur_pts:
             return
         self.on_move(e)
@@ -886,8 +895,8 @@ class App(tk.Tk):
             self.cur_pts = [self.cur_pts[0], [e.x, e.y]]
 
     def on_release(self, e):
-        if self.tool == "select" and self.drag:
-            return self.drop()
+        if self.tool == "select" and (self.drag or self.band):
+            return self.drop() if self.drag else self.band_done(e)
         if not self.can_draw() or not self.cur_pts:
             return
         if self.tool == "pen":
@@ -905,7 +914,12 @@ class App(tk.Tk):
             obj["text"] = text
         self.send_reliable({"type": "ADD", "obj": obj})
 
-    # ---- select tool: click an object, drag it, release -> one MOVE request (synced to everyone)
+    # ---- select tool: pick one object or many, drag them, release -> one MOVE request (synced to everyone)
+    #   click an object            select it (and drag it)
+    #   Shift + click              add it to / take it out of the selection
+    #   drag over empty board      selection rectangle: everything it touches is selected
+    #   Ctrl + A                   select everything; Esc clears the selection
+    #   drag any selected object   the whole selection moves together
     def object_at(self, x, y, r=4):
         """Id of the topmost visible object under (x, y), or None."""
         for item in reversed(self.canvas.find_overlapping(x - r, y - r, x + r, y + r)):
@@ -916,39 +930,89 @@ class App(tk.Tk):
                     return tag[2:]
         return None
 
+    def objects_in(self, x0, y0, x1, y1):
+        """Ids of the visible objects that the rectangle touches."""
+        found = set()
+        for item in self.canvas.find_overlapping(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)):
+            if self.canvas.itemcget(item, "state") == "hidden":
+                continue
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("o_") and tag[2:] in self.objs and self.objs[tag[2:]]["visible"]:
+                    found.add(tag[2:])
+        return found
+
     def select_at(self, e):
         oid = self.object_at(e.x, e.y)
-        self.canvas.delete("sel")
-        if oid is None:
-            self.drag = None
-            return
-        self.drag = {"id": oid, "x0": e.x, "y0": e.y, "dx": 0, "dy": 0}
-        self.show_selection(oid)
+        shift = bool(getattr(e, "state", 0) & 0x0001)
+        self.drag = self.band = None
+        if oid is None:                       # empty board: start a selection rectangle
+            if not shift:
+                self.sel.clear()
+            self.band = (e.x, e.y)
+        elif shift:                           # add / remove one object
+            self.sel ^= {oid}
+        elif oid not in self.sel:
+            self.sel = {oid}
+        if oid is not None and oid in self.sel:
+            self.drag = {"ids": [i for i in self.objs if i in self.sel], "x0": e.x, "y0": e.y, "dx": 0, "dy": 0}
+        self.show_selection()
 
-    def show_selection(self, oid):
+    def select_all(self, _e=None, button=False):
+        typing = isinstance(self.focus_get(), (tk.Entry, ttk.Entry, tk.Text))     # Ctrl+A in the chat box is not for us
+        if (typing and not button) or not self.room or not self.can_draw():
+            return
+        if self.tool != "select":
+            self.tool_var.set("select")
+            self.set_tool()
+        self.sel = {i for i, r in self.objs.items() if r["visible"] and r["obj"].get("kind") != "enc"}
+        self.show_selection()
+        return "break"
+
+    def select_none(self, _e=None):
+        if self.sel and not self.drag:
+            self.sel.clear()
+            self.show_selection()
+
+    def show_selection(self):
+        """Dashed blue frame around every selected object (objects that were erased meanwhile drop out)."""
         self.canvas.delete("sel")
-        box = self.canvas.bbox("o_" + oid)
-        if box:
-            x0, y0, x1, y1 = box
-            self.canvas.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline="#1e88e5", dash=(4, 3),
-                                         width=1, tags="sel")
+        self.sel = {i for i in self.sel if i in self.objs and self.objs[i]["visible"]}
+        for oid in self.sel:
+            box = self.canvas.bbox("o_" + oid)
+            if box:
+                x0, y0, x1, y1 = box
+                self.canvas.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline="#1e88e5", dash=(4, 3),
+                                             width=1, tags="sel")
+
+    def band_to(self, e):
+        self.canvas.delete("band")
+        self.canvas.create_rectangle(*self.band, e.x, e.y, outline="#1e88e5", dash=(2, 2), width=1, tags="band")
+
+    def band_done(self, e):
+        (x0, y0), self.band = self.band, None
+        self.canvas.delete("band")
+        if abs(e.x - x0) > 2 or abs(e.y - y0) > 2:        # a plain click on empty board only clears
+            self.sel |= self.objects_in(x0, y0, e.x, e.y)
+        self.show_selection()
 
     def drag_to(self, e):
         d = self.drag
         ddx, ddy = e.x - d["x0"] - d["dx"], e.y - d["y0"] - d["dy"]
         if ddx or ddy:
-            self.canvas.move("o_" + d["id"], ddx, ddy)       # local preview; nothing is sent until release
+            for oid in d["ids"]:
+                self.canvas.move("o_" + oid, ddx, ddy)       # local preview; nothing is sent until release
             self.canvas.move("sel", ddx, ddy)
             d["dx"] += ddx
             d["dy"] += ddy
 
     def drop(self):
         d, self.drag = self.drag, None
-        self.canvas.delete("sel")
         if d["dx"] or d["dy"]:
-            msg = {"type": "MOVE", "ids": [d["id"]], "dx": d["dx"], "dy": d["dy"]}
-            self.send_reliable(msg)
-            self.moves[msg["msg_id"]] = [d["id"]]
+            for k in range(0, len(d["ids"]), MOVE_MAX_IDS):      # the server takes at most 500 ids per MOVE
+                ids = d["ids"][k:k + MOVE_MAX_IDS]
+                msg = {"type": "MOVE", "ids": ids, "dx": d["dx"], "dy": d["dy"]}
+                self.send_reliable(msg)
+                self.moves[msg["msg_id"]] = ids
 
     def shift_obj(self, oid, dx, dy):
         """Apply a MOVE to my copy of one object (also to its sealed form, so it lands right once decrypted)."""
@@ -1047,16 +1111,22 @@ class App(tk.Tk):
                 self.canvas.delete(self.live.pop(op["by"]))
         elif op["op"] == "MOVE":
             for i in op["ids"]:
-                if self.drag and self.drag["id"] == i and op.get("by") != self.me:
-                    self.drag = None                    # someone else moved it under my mouse: theirs wins
-                    self.canvas.delete("sel")
+                if self.drag and i in self.drag["ids"] and op.get("by") != self.me:
+                    d, self.drag = self.drag, None      # someone else moved it under my mouse: theirs wins
+                    for j in d["ids"]:                  # put my preview back where the objects really are
+                        if j in self.objs:
+                            self.draw_obj(self.objs[j]["obj"], self.objs[j]["visible"])
                 self.shift_obj(i, op["dx"], op["dy"])
+            if self.sel and not self.drag:
+                self.show_selection()
         else:
             for i in op["ids"]:
                 if i in self.objs:
                     self.objs[i]["visible"] = op["visible"]
                     self.canvas.itemconfigure("o_" + i, state="normal" if op["visible"] else "hidden")
                 self.erased.discard(i)
+            if self.sel and not self.drag:
+                self.show_selection()               # an erased object leaves the selection
 
     # ------------------------------------------------------------ message pump
     def pump(self):
@@ -1160,6 +1230,8 @@ class App(tk.Tk):
             for oid in self.moves.pop(m.get("msg_id"), []):     # my drag preview -> the server's position
                 if oid in self.objs:                             # (corrects it if the move was refused)
                     self.draw_obj(self.objs[oid]["obj"], self.objs[oid]["visible"])
+            if self.sel and not self.drag:
+                self.show_selection()
             if self.outbox.pop(m.get("msg_id"), None) is not None:
                 self.acked += 1
                 self.sent_at, self.rto_tries = time.time(), 0      # progress: restart the retransmit timer

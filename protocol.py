@@ -7,6 +7,7 @@ LAN discovery uses UDP instead: a client broadcasts DISCOVER_MAGIC to
 DISCOVERY_PORT and every server on the subnet answers with a small JSON datagram
 (unicast, back to the sender) saying which TCP port it listens on.
 """
+import errno
 import json
 import socket
 import struct
@@ -117,27 +118,67 @@ def simplify(points, eps=1.0):
     return [p for p, k in zip(points, keep) if k]
 
 
+def port_taken(host, port, timeout=0.3):
+    """True if some program already accepts TCP connections on this port of this machine.
+
+    bind() alone does not tell us on Windows: there SO_REUSEADDR lets two programs listen on the same
+    port, and the connections go to the other one (seen in the lab: EDB Postgres' web server on 8080
+    answered the phones instead of the whiteboard). So we simply try to connect before we bind."""
+    targets = ("127.0.0.1", "::1") if host in ("0.0.0.0", "", "::") else (host,)
+    for h in targets:
+        try:
+            socket.create_connection((h, port), timeout=timeout).close()
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def _own_port(s):
+    """Socket options before bind(): this port is ours alone.
+    Linux/macOS: SO_REUSEADDR only skips the TIME_WAIT pause after a restart; a second listener still
+    gets "address already in use". Windows: SO_REUSEADDR would allow a second listener (port hijacking),
+    so SO_EXCLUSIVEADDRUSE is used instead; Windows has no TIME_WAIT pause for listening sockets."""
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def listen_socket(host, port, kind=socket.SOCK_STREAM):
     """A listening/bound socket. For the default "all addresses" host this is a dual-stack IPv6
     socket (IPV6_V6ONLY off): one socket accepts both IPv6 clients and IPv4 clients (which then
     appear as IPv4-mapped addresses, ::ffff:a.b.c.d). Falls back to plain IPv4 where IPv6 is missing.
+    Raises OSError (EADDRINUSE) if another program already uses the port.
     Returns (socket, True if IPv6 is served)."""
+    if kind == socket.SOCK_STREAM and port and port_taken(host, port):
+        raise OSError(errno.EADDRINUSE, f"port {port} is already used by another program")
     if host in ("0.0.0.0", "", "::"):
         s = None
         try:
             s = socket.socket(socket.AF_INET6, kind)
             s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _own_port(s)
             s.bind(("::", port))
             return s, True
-        except (OSError, AttributeError):
+        except OSError as e:
+            if s is not None:
+                s.close()
+            if e.errno in (errno.EADDRINUSE, errno.EACCES, getattr(errno, "WSAEADDRINUSE", -1),
+                           getattr(errno, "WSAEACCES", -1)):
+                raise                        # taken: do not quietly retry on IPv4 only
+        except AttributeError:
             if s is not None:
                 s.close()
         host = "0.0.0.0"
     v6 = ":" in host
     s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, kind)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, port))
+    try:
+        _own_port(s)
+        s.bind((host, port))
+    except OSError:
+        s.close()
+        raise
     return s, v6
 
 
