@@ -84,7 +84,9 @@ try:
         draw(a, i); spin(a, b, secs=0.15)
         draw(b, i + 20); spin(a, b, secs=0.15)
     shot(a.labwin, "screenshot_chaos_lab.png")
-    ok = spin(a, b, secs=40, until=lambda: a.last_seq == b.last_seq == 24 and not a.outbox and not b.outbox)
+    # 90 s, not 40: with 30% loss each way an ACK round fails about half the time, and the retransmit timer backs off
+    # up to 8 x RTO (24 s), so a few unlucky rounds in a row can take longer than 40 s (seen once on Windows CI)
+    ok = spin(a, b, secs=90, until=lambda: a.last_seq == b.last_seq == 24 and not a.outbox and not b.outbox)
     assert ok, (a.last_seq, b.last_seq, len(a.outbox), len(b.outbox))
     assert visible(a) == visible(b) and len(visible(a)) == 24
     repaired = a.retx + b.retx + a.gaps + b.gaps + a.hb_resyncs + b.hb_resyncs
