@@ -1,3 +1,5 @@
 pillow        # optional: PNG export and JPEG/BMP images
 cryptography  # recommended: lets the server create its TLS certificate (otherwise the openssl tool is used)
+qrcode        # optional: QR code in the "Phone join" window (the link is shown without it)
+sounddevice   # optional: microphone/speaker for voice chat (Linux also needs: sudo apt install libportaudio2)
 pyinstaller   # only for building the .exe / Linux binaries

@@ -95,6 +95,14 @@ class Store:
         finally:
             con.close()
 
+    def wipe(self):
+        """Standby server: forget everything before taking a fresh copy from the primary."""
+        for t in ("rooms", "members", "banned", "ops", "chat", "versions", "users"):
+            self._put(f"DELETE FROM {t}")
+
+    def set_secret(self, hex_value):
+        self._put("INSERT OR REPLACE INTO meta VALUES ('jwt_secret', ?)", (hex_value,))
+
     def add_chat(self, code, entry, msg_id=None):
         self._put("INSERT INTO chat (room, ts, user, text, msg_id) VALUES (?,?,?,?,?)",
                   (code, entry["ts"], entry["user"], entry["text"], msg_id))
