@@ -218,6 +218,10 @@ class Net:
     def close(self):
         self.gen += 1
         self.open = False
+        try:                    # shutdown first: a plain close() while the reader thread is blocked in recv()
+            self.sock.shutdown(socket.SHUT_RDWR)      # may not reach the server, which then still shows us online
+        except (OSError, AttributeError):
+            pass
         try:
             self.sock.close()
         except (OSError, AttributeError):
@@ -262,6 +266,9 @@ class App(tk.Tk):
         self.pts_raw = self.pts_sent = 0      # stroke points before / after simplification
         self.labwin = self.inspwin = self.replaywin = self.qrwin = None
         self.e2e_keys, self.sealed, self.pending_plain = None, {}, {}   # end-to-end encryption
+        self.cfg = {"voice": False, "e2e": False}   # room switches, set by the host only (ROOM_SET)
+        self.banned = []                            # people the host removed (the host can let them back in)
+        self.voice_wanted = False                   # host: open the voice window once the room switch is on
         self.file_out = {}                    # offer id -> p2p.Sender (files I am offering)
         if getattr(self, "vc", None):
             self.close_voice()
@@ -559,18 +566,23 @@ class App(tk.Tk):
         self.canvas.pack(side="left")
         side = ttk.Frame(body, padding=4)
         side.pack(side="left", fill="y")
-        ttk.Label(side, text="Participants").pack(anchor="w")
+        r = ttk.Frame(side)
+        r.pack(fill="x")
+        ttk.Label(r, text="Participants").pack(side="left")
+        ttk.Button(r, text="Exit room", command=self.exit_room).pack(side="right")
         self.plist = tk.Listbox(side, width=28, height=9, exportselection=False)
         self.plist.pack()
         if self.me == self.host_user:
             r = ttk.Frame(side)
             r.pack(fill="x")
-            ttk.Button(r, text="Toggle edit/view", command=self.toggle_role).pack(side="left")
-            ttk.Button(r, text="Kick", command=self.kick).pack(side="left")
+            ttk.Button(r, text="Edit/view", width=9, command=self.toggle_role).pack(side="left")
+            ttk.Button(r, text="Kick", width=5, command=self.kick).pack(side="left")
+            ttk.Button(r, text="Let back in", width=10, command=self.unban).pack(side="left")
         r = ttk.Frame(side)
         r.pack(fill="x", pady=(2, 0))
         ttk.Button(r, text="Send file", width=9, command=self.send_file).pack(side="left")
-        ttk.Button(r, text="Voice", width=6, command=self.open_voice).pack(side="left")
+        self.voice_btn = ttk.Button(r, text="Voice", width=9, command=self.open_voice)
+        self.voice_btn.pack(side="left")
         self.e2e_btn = ttk.Button(r, text="E2E key", width=9, command=self.ask_e2e)
         self.e2e_btn.pack(side="left")
         self.file_label = ttk.Label(side, text="", foreground="#555")
@@ -598,7 +610,7 @@ class App(tk.Tk):
         """Send a request that must not be lost: it keeps a msg_id and stays in the outbox until ACKed.
         If the connection is down, the send fails silently and the request goes out after reconnecting."""
         msg["msg_id"] = uuid.uuid4().hex
-        if msg.get("type") == "ADD" and self.e2e_keys:      # end-to-end: replace the object by its ciphertext
+        if msg.get("type") == "ADD" and self.e2e_keys and self.cfg["e2e"]:   # end-to-end: send ciphertext only
             o = msg["obj"]
             self.pending_plain[o["id"]] = o
             body = json.dumps({k: v for k, v in o.items() if k != "id"}, separators=(",", ":")).encode("utf-8")
@@ -665,7 +677,7 @@ class App(tk.Tk):
     def send_chat(self, _e):
         t = self.chat_entry.get().strip()
         if t:
-            if self.e2e_keys:                       # the server relays and stores only ciphertext
+            if self.e2e_keys and self.cfg["e2e"]:   # the server relays and stores only ciphertext
                 t = e2e.PREFIX + e2e.seal(self.e2e_keys, t[:600].encode("utf-8"))
             self.send_reliable({"type": "CHAT", "text": t})
             self.chat_entry.delete(0, "end")
@@ -685,7 +697,33 @@ class App(tk.Tk):
 
     def selected_user(self):
         sel = self.plist.curselection()
-        return self.users[sel[0]]["name"] if sel else None
+        return self.users[sel[0]]["name"] if sel and sel[0] < len(self.users) else None
+
+    def selected_removed(self):
+        """Host: the removed person selected in the list (they are listed below the participants)."""
+        sel = self.plist.curselection()
+        i = sel[0] - len(self.users) if sel else -1
+        return self.banned[i] if 0 <= i < len(self.banned) else None
+
+    def unban(self):
+        u = self.selected_removed()
+        if u:
+            self.net.send({"type": "UNBAN", "user": u})
+        elif not self.banned:
+            messagebox.showinfo("Let back in", "Nobody has been removed from this room.", parent=self)
+        else:
+            messagebox.showinfo("Let back in", "Select a removed person (marked \u2715 at the end of the list) first.",
+                                parent=self)
+
+    def exit_room(self):
+        """Leave the room and go back to the join screen. The app stays open; the room goes on without us."""
+        waiting = len(self.outbox)
+        if not messagebox.askyesno("Exit room", f"Leave room {self.room} and go back to the join screen?"
+                                   + (f"\n\n{waiting} action(s) made while offline were not delivered yet and "
+                                      "will be lost." if waiting and self.reconnecting else ""), parent=self):
+            return
+        self.offline, self.reconnecting = True, False       # no automatic reconnect: this is on purpose
+        self.back_to_login()
 
     def toggle_role(self):
         u = self.selected_user()
@@ -1191,6 +1229,8 @@ class App(tk.Tk):
             self.show_security()
             self.load_snapshot(m["snapshot"])
             self.web_port, self.voice_port = m.get("web"), m.get("voice")
+            self.banned = m.get("banned", [])
+            self.set_cfg(m.get("cfg", {}))
             if self.vc:                               # voice follows the board to the new connection
                 self.start_voice()
             self.set_backups(m.get("backups", []))
@@ -1244,6 +1284,8 @@ class App(tk.Tk):
             self.set_backups(m.get("backups", []))
         elif t == "INVITE":
             self.show_invite(m)
+        elif t == "ROOM":
+            self.set_cfg(m.get("cfg", {}))
         elif t == "REPLAY":
             self.show_replay(m["ops"])
         elif t == "_DIAG":
@@ -1307,6 +1349,7 @@ class App(tk.Tk):
             self.add_chat(f"[{m['ts']}] {m['user']}: {self.chat_text(m['text'])}")
         elif t == "USERS":
             self.users = m["users"]
+            self.banned = m.get("banned", self.banned)
             me = next((u for u in self.users if u["name"] == self.me), None)
             if me:
                 self.role = me["role"]
@@ -1341,6 +1384,7 @@ class App(tk.Tk):
 
     def refresh_users(self):
         keep = self.selected_user()          # keep the host's selection across the 1 Hz refresh
+        keep_removed = self.selected_removed()
         self.plist.delete(0, "end")
         for i, u in enumerate(self.users):
             tags = ("host " if u["host"] else "") + (u["role"] if u["role"] == "viewer" else "")
@@ -1352,6 +1396,12 @@ class App(tk.Tk):
                 self.canvas.delete(self.cursor_tag(u["name"]))
             if u["name"] == keep:
                 self.plist.selection_set(i)
+        if self.me == self.host_user:        # the host also sees who was removed, and can let them back in
+            for name in self.banned:
+                self.plist.insert("end", f"\u2715 {name} (removed)")
+                self.plist.itemconfig("end", fg="#999")
+                if name == keep_removed:
+                    self.plist.selection_set("end")
 
     # ------------------------------------------------------------ network statistics
     def lat_stats(self):
@@ -1938,7 +1988,10 @@ class App(tk.Tk):
             self.clipboard_append(m["url"])
         ttk.Button(w, text="Copy link", command=copy).pack()
         ttk.Label(w, foreground="#666", padding=8, justify="center",
-                  text=f"The link holds a signed invite (JWT) for room {m['room']} only, valid until "
+                  text=f"This is YOUR link ({m.get('by', self.me)}): at most {m.get('max', 2)} phones/browsers can be "
+                       f"connected through it at the same time"
+                       + (f" (now: {', '.join(m['used'])})" if m.get("used") else "") + ".\n"
+                       f"It holds a signed invite (JWT) for room {m['room']} only, valid until "
                        f"{time.strftime('%H:%M', time.localtime(m['exp']))}.\nGuests appear as 'name (web)'. "
                        "The browser page uses HTTP + WebSocket on the server's web port.").pack()
 
@@ -1965,13 +2018,47 @@ class App(tk.Tk):
             self.sealed[o["id"]] = o
         return o
 
+    def set_cfg(self, cfg):
+        """Room switches (voice chat, end-to-end encryption). Only the host can flip them; everyone follows."""
+        was = dict(self.cfg)
+        self.cfg = {k: bool(cfg.get(k, False)) for k in ("voice", "e2e")}
+        if not hasattr(self, "canvas"):
+            return
+        self.show_e2e()
+        self.voice_btn.config(text="Voice" if self.cfg["voice"] else "Voice: off")
+        if was["voice"] and not self.cfg["voice"] and self.voicewin and self.voicewin.winfo_exists():
+            self.close_voice()                    # the host switched voice chat off: hang up
+            self.voicewin.destroy()
+        if self.cfg["voice"] and self.voice_wanted:
+            self.voice_wanted = False
+            self.open_voice()
+
+    def show_e2e(self):
+        on = self.cfg["e2e"]
+        self.e2e_btn.config(text="E2E: ON" if on and self.e2e_keys else "E2E: key?" if on else "E2E key")
+        self.show_security()
+
     def ask_e2e(self):
+        host = self.me == self.host_user
+        if not host and not self.cfg["e2e"]:
+            return messagebox.showinfo("End-to-end encryption", "End-to-end encryption is off for this room.\n\n"
+                                       f"Only the host ({self.host_user}) can turn it on. Once it is on, type the "
+                                       "passphrase the host tells you here.", parent=self)
         s = simpledialog.askstring(
-            "End-to-end key", "Passphrase for this room (everyone must type the same one; it is never sent).\n"
-            "From now on your drawings and chat are encrypted on this PC; the server relays\nand stores "
-            "only ciphertext. Leave empty to turn it off.", show="*", parent=self)
-        if s is not None:
-            self.set_e2e(s)
+            "End-to-end key",
+            ("Passphrase for this room (it is never sent; tell it to the others yourself).\n"
+             "This turns end-to-end encryption ON for the whole room: drawings and chat are encrypted\n"
+             "on each PC, the server relays and stores only ciphertext. Leave empty to turn it OFF for everyone."
+             if host else
+             f"The host ({self.host_user}) turned end-to-end encryption on.\nType the passphrase the host chose "
+             "(it is never sent). Without it you cannot read\nwhat the others draw or write, and what you add "
+             "is not encrypted."), show="*", parent=self)
+        if s is None:
+            return
+        if host:
+            self.cfg["e2e"] = bool(s)             # at once, so nothing I draw meanwhile goes out in clear
+            self.net.send({"type": "ROOM_SET", "e2e": bool(s)})
+        self.set_e2e(s)
 
     def set_e2e(self, passphrase):
         self.e2e_keys = e2e.derive(passphrase, self.room) if passphrase else None
@@ -1980,10 +2067,9 @@ class App(tk.Tk):
             if plain is not o and oid in self.objs:
                 self.objs[oid]["obj"] = plain
                 self.draw_obj(plain, self.objs[oid]["visible"])
-        self.e2e_btn.config(text="E2E: ON" if self.e2e_keys else "E2E key")
-        self.show_security()
-        self.add_chat("* end-to-end encryption " + ("ON: your new drawings and chat are unreadable for the server"
-                                                    if self.e2e_keys else "off"))
+        self.show_e2e()
+        self.add_chat("* end-to-end key " + ("set: while the host keeps encryption on, your new drawings and chat "
+                                             "are unreadable for the server" if self.e2e_keys else "cleared"))
 
     # ------------------------------------------------------------ peer-to-peer file transfer
     @staticmethod
@@ -2104,6 +2190,16 @@ class App(tk.Tk):
                                        parent=self)
         if self.voicewin and self.voicewin.winfo_exists():
             return self.voicewin.lift()
+        host = self.me == self.host_user
+        if not self.cfg["voice"]:
+            if not host:
+                return messagebox.showinfo("Voice", "Voice chat is off for this room.\n\nOnly the host "
+                                           f"({self.host_user}) can turn it on.", parent=self)
+            if not messagebox.askyesno("Voice", "Voice chat is off for this room.\n\nTurn it on for everyone?",
+                                       parent=self):
+                return
+            self.voice_wanted = True              # the window opens when the server confirms (ROOM message)
+            return self.net.send({"type": "ROOM_SET", "voice": True})
         self.start_voice()
         self.voicewin = w = tk.Toplevel(self)
         w.title("Voice chat (UDP)")
@@ -2121,6 +2217,9 @@ class App(tk.Tk):
                         command=lambda: talk(False)).pack()
         self.voice_text = tk.Text(w, width=58, height=9, font=("Courier", 10), state="disabled", bg="#f7f7f7")
         self.voice_text.pack(padx=12, pady=10)
+        if host:
+            ttk.Button(w, text="Turn voice chat off for everyone",
+                       command=lambda: self.net.send({"type": "ROOM_SET", "voice": False})).pack(pady=(0, 10))
 
         def closed():
             self.close_voice()
