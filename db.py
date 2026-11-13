@@ -13,6 +13,7 @@ Tables
   rooms(code, password, host, created)
   members(room, name, token, color, role)        - identity used for reconnection
   banned(room, name)                             - users kicked by the host
+  room_cfg(room, cfg)                            - room switches set by the host (JSON: voice, e2e)
   ops(room, seq, ts, by, kind, body)             - the sequenced op log (body = op as JSON)
   chat(room, id, ts, user, text, msg_id)
   versions(room, id, label, ts, seq, visible)    - version history (visible = JSON list of ids)
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS rooms   (code TEXT PRIMARY KEY, password TEXT, host T
 CREATE TABLE IF NOT EXISTS members (room TEXT, name TEXT, token TEXT, color TEXT, role TEXT,
                                     PRIMARY KEY (room, name));
 CREATE TABLE IF NOT EXISTS banned  (room TEXT, name TEXT, PRIMARY KEY (room, name));
+CREATE TABLE IF NOT EXISTS room_cfg(room TEXT PRIMARY KEY, cfg TEXT);
 CREATE TABLE IF NOT EXISTS ops     (room TEXT, seq INTEGER, ts REAL, by TEXT, kind TEXT, body TEXT,
                                     PRIMARY KEY (room, seq));
 CREATE TABLE IF NOT EXISTS chat    (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, ts TEXT, user TEXT, text TEXT,
@@ -67,6 +69,12 @@ class Store:
         self._put("DELETE FROM members WHERE room=? AND name=?", (code, name))
         self._put("INSERT OR IGNORE INTO banned VALUES (?,?)", (code, name))
 
+    def unban(self, code, name):
+        self._put("DELETE FROM banned WHERE room=? AND name=?", (code, name))
+
+    def set_cfg(self, code, cfg):
+        self._put("INSERT OR REPLACE INTO room_cfg VALUES (?,?)", (code, json.dumps(cfg)))
+
     def add_op(self, code, op):
         self._put("INSERT OR REPLACE INTO ops VALUES (?,?,?,?,?,?)",
                   (code, op["seq"], time.time(), op.get("by"), op["op"], json.dumps(op, separators=(",", ":"))))
@@ -97,7 +105,7 @@ class Store:
 
     def wipe(self):
         """Standby server: forget everything before taking a fresh copy from the primary."""
-        for t in ("rooms", "members", "banned", "ops", "chat", "versions", "users"):
+        for t in ("rooms", "members", "banned", "room_cfg", "ops", "chat", "versions", "users"):
             self._put(f"DELETE FROM {t}")
 
     def set_secret(self, hex_value):
@@ -158,6 +166,8 @@ class Store:
                 "members": con.execute("SELECT name, token, color, role FROM members WHERE room=?",
                                        (code,)).fetchall(),
                 "banned": [r[0] for r in con.execute("SELECT name FROM banned WHERE room=?", (code,))],
+                "cfg": json.loads((con.execute("SELECT cfg FROM room_cfg WHERE room=?", (code,)).fetchone()
+                                   or ["{}"])[0]),
                 "ops": [json.loads(r[0]) for r in
                         con.execute("SELECT body FROM ops WHERE room=? ORDER BY seq", (code,))],
                 "chat": con.execute("SELECT ts, user, text, msg_id FROM chat WHERE room=? ORDER BY id",
