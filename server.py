@@ -1,51 +1,18 @@
 """LAN whiteboard server.
 
-Architecture: one listener thread, one reader thread + one writer thread per client,
-one UDP discovery thread, and one lock-protected Room object per session. The Room
-holds the authoritative state: an ordered op log. Every accepted op gets the next
-sequence number (seq) under the room lock, so all clients see the same total order.
+Each room keeps an ordered op log. Every accepted change (ADD, VIS, MOVE) gets the next
+sequence number under the room lock, so all clients apply changes in the same order.
 
-Sending never blocks the room: each client has its own outgoing queue drained by its
-own writer thread. A client that stops reading (full TCP window) only stalls its own
-writer; after TIMEOUT_SEC (or once its queue is too big) it is dropped and will
-reconnect. Without this, one slow laptop would freeze drawing for everyone
-("head-of-line blocking").
+Each client has its own reader and writer thread with an outgoing queue, so one slow
+client can't hold up the room. Requests carry a msg_id and are ACKed; clients resend
+anything unacknowledged after a reconnect and the server filters out duplicates.
 
-Op types (state-changing, sequenced, stored):
-  ADD  - a new drawable object (stroke / line / rect / oval / text / sticky note / image)
-  VIS  - set visibility of object ids (used by erase, clear, undo, redo)
-  MOVE - shift object ids by (dx, dy) (select-and-drag tool; undo/redo send the opposite / same shift)
-Everything else (cursor, live stroke preview, chat, presence) is not part of the canvas log.
+Rooms are saved to SQLite (db.py) and rebuilt on startup. Accounts use PBKDF2 password
+hashes and JWTs (auth.py), and all TCP traffic is TLS unless --no-auth / --no-tls.
+Browsers connect through web.py, voice goes through the UDP relay in voice.py, and
+--standby-of runs a second server as a live replica that takes over if this one dies.
 
-Reliability: every client request that carries a msg_id is answered with ACK once it
-has been processed. The client keeps unacknowledged requests and resends them after
-a reconnect; the per-user msg_id filter makes the resend harmless if the original
-had already arrived (at-least-once delivery + duplicate suppression = exactly-once effect).
-
-Persistence: every change is also written to a SQLite database (db.py, default
-whiteboard.db next to the server). On startup all rooms are rebuilt by replaying their
-op logs, so a server restart does not lose any board, chat or history, and connected
-clients resume automatically.
-
-Accounts and security (auth.py): users register/log in with a password that is stored only
-as a salted PBKDF2 hash. A successful login returns a JWT (signed with HMAC-SHA256); the client
-shows it when joining or reconnecting, and the server takes the user name from the verified token,
-so nobody can act under someone else's name. Failed logins are rate limited per IP address.
-All TCP traffic is wrapped in TLS (self-signed certificate created on first start), so passwords,
-tokens and drawings cannot be read or changed on the LAN. --no-auth / --no-tls turn these off.
-
-Extras (each one is a networking topic of its own):
-  web.py        - browsers / phones join through HTTP + a hand-written WebSocket server (second port).
-  chaos lab     - the host can make the server drop / delay messages for a room; ACK + retransmit timer,
-                  in-order processing with a reorder buffer, sequence-gap resync and the heartbeat
-                  check repair the board.
-  compression   - big frames are zlib-compressed (flag = top bit of the length prefix).
-  hot standby   - `--standby-of HOST:PORT` turns a second server into a live replica that takes over
-                  when the primary dies (primary/backup replication of the op log).
-
-Undo/redo is per user: it only affects that user's own latest action, so one
-person's undo never destroys another person's work. (Undo stacks are not stored in
-the database, so they start empty after a server restart.)
+Undo/redo only touches your own latest action and isn't saved across restarts.
 """
 import argparse
 import heapq
@@ -76,13 +43,13 @@ import web
 from webpage import ADMIN_PAGE, PAGE
 
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-INVITE_DEVICES = 2        # browsers/phones that can be connected through ONE member's invite links at a time
-E2E_PREFIX = "e2e1:"      # an end-to-end encrypted chat line (see e2e.py)
-KINDS = {"stroke", "line", "rect", "oval", "text", "sticky", "image", "enc"}   # enc = end-to-end encrypted
-MAX_IMAGE_B64 = 700_000           # ~500 KB image after base64
-MAX_ENC_B64 = 1_000_000           # one end-to-end encrypted object (an encrypted image fits)
-MAX_ROOM_IMAGE_B64 = 20_000_000   # all images in a room (erased ones too); keeps snapshots < MAX_MSG
-MAX_QUEUED_BYTES = 64 * 1024 * 1024  # per-client outgoing backlog before we give up on that client
+INVITE_DEVICES = 2  # phones/browsers per member's invite links
+E2E_PREFIX = "e2e1:"
+KINDS = {"stroke", "line", "rect", "oval", "text", "sticky", "image", "enc"}  # end-to-end encrypted
+MAX_IMAGE_B64 = 700_000  # about 500 KB of image
+MAX_ENC_B64 = 1_000_000
+MAX_ROOM_IMAGE_B64 = 20_000_000  # all images in a room, keeps snapshots under MAX_MSG
+MAX_QUEUED_BYTES = 64 * 1024 * 1024  # outgoing backlog before we drop a client
 MAX_VERSIONS = 40
 SAVE_DIR = "saves"
 USER_COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
@@ -90,7 +57,7 @@ USER_COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
 
 
 class Stats:
-    """Server-wide network counters (shown in the console every 10 s and sent to clients in PONG)."""
+    """Server-wide traffic counters (printed every 10 s, also sent in PONG)."""
     def __init__(self):
         self.t0 = time.time()
         self.lock = threading.Lock()
@@ -112,40 +79,39 @@ class Stats:
 
 
 stats = Stats()
-store = None        # db.Store, or None when started with --no-db
-AUTH = True         # accounts required (--no-auth turns this off: anyone joins with any name)
-users = {}          # lower-case name -> (name, pw_hash)
+store = None  # None with --no-db
+AUTH = True
+users = {}  # lower-case name -> (name, pw_hash)
 users_lock = threading.Lock()
-jwt_secret = secrets.token_bytes(32)   # replaced by the one stored in the database
+jwt_secret = secrets.token_bytes(32)  # replaced by the stored one
 limiter = RateLimiter()
-tls_ctx = None      # ssl.SSLContext when TLS is on
-DUMMY_HASH = hash_password("timing-equaliser")   # so "no such user" takes as long as "wrong password"
-COMPRESS = True     # --no-compress turns frame compression off (e.g. for a readable Wireshark capture)
-ROLE = "primary"    # "standby" while this server is a replica of another one (--standby-of)
-CLUSTER_KEY = ""    # shared secret a standby must present before it is given the data (--cluster-key)
-replicas = []       # connections of standby servers that receive every state change
-WEB = None          # port of the HTTP/WebSocket listener, or None
-VOICE = None        # UDP port of the voice relay, or None
-RELAY = None        # the voice relay itself (voice.Relay)
+tls_ctx = None
+DUMMY_HASH = hash_password("timing-equaliser")  # so an unknown user takes as long as a wrong password
+COMPRESS = True
+ROLE = "primary"  # "standby" while replicating another server
+CLUSTER_KEY = ""
+replicas = []
+WEB = None
+VOICE = None
+RELAY = None
 TCP_PORT = DEFAULT_PORT
 
-# Chaos lab: which message types may be DROPPED. Only the ones that have a recovery mechanism:
-#   client -> server requests with a msg_id are retransmitted until ACKed; OP / ACK losses are repaired
-#   by the sequence-gap resync and the retransmit timer; PING/PONG, LIVE, CURSOR, LASER are disposable.
-# Everything else (chat lines, user lists, join replies) is only delayed, never dropped.
+# Chaos lab only drops messages that something will recover: requests with a msg_id are
+# resent until ACKed, lost OPs are caught by the gap check, and cursor/preview/ping
+# traffic doesn't matter. Everything else is only delayed.
 LOSSY_OUT = {"OP", "ACK", "PONG", "LIVE", "CURSOR", "LASER", "OPS_SINCE", "SNAPSHOT"}
-LOSSY_IN = {"PING", "LIVE", "CURSOR", "LASER", "RESYNC_REQ"}       # plus anything that carries a msg_id
+LOSSY_IN = {"PING", "LIVE", "CURSOR", "LASER", "RESYNC_REQ"}
 
-# Quality of service. Disposable traffic is sent only when no board traffic is waiting, is limited per
-# client on the way in (token bucket), and is shed first when a link cannot keep up.
+# Cursor/preview/laser traffic is rate limited per client, waits behind board traffic
+# and is dropped first on a slow link.
 LOW_PRIO = {"CURSOR", "LIVE", "LASER"}
-SHAPED = LOW_PRIO | {"OP"}          # what the chaos lab's bandwidth cap applies to
-MAX_LOW_BACKLOG = 30                # disposable frames waiting per client before the oldest are dropped
-TRANSIENT_RATE, TRANSIENT_BURST = 80, 80   # CURSOR/LIVE/LASER messages accepted per client per second / burst
+SHAPED = LOW_PRIO | {"OP"}
+MAX_LOW_BACKLOG = 30
+TRANSIENT_RATE, TRANSIENT_BURST = 80, 80
 
 
 def _plain(x):
-    """Room / Member objects as plain data for the replication stream."""
+    """Room and Member objects as plain data for replication."""
     if isinstance(x, Room):
         return {"code": x.code, "password": x.password, "host": x.host}
     if isinstance(x, Member):
@@ -154,9 +120,9 @@ def _plain(x):
 
 
 def persist(method, *args):
-    """Record a state change: queue the database write (never blocks; see db.py) and forward the
-    same event to every standby server. Called with the room lock held, so the standby sees the
-    events of a room in exactly the order they happened."""
+    """Record a state change: queue the database write and forward it to the standbys.
+    Called with the room lock held, so standbys see a room's changes in order.
+    """
     if store is not None:
         getattr(store, method)(*args)
     if replicas:
@@ -166,18 +132,18 @@ def persist(method, *args):
             r.send_enc(enc)
 
 
-events = deque(maxlen=200)     # recent server events, shown on the admin dashboard
+events = deque(maxlen=200)
 ADMIN_KEY = ""
 
 
 def event(text, flush=True):
-    """Print a server event and remember it for the dashboard."""
+    """Print a server event and keep it for the dashboard."""
     print(text, flush=flush)
     events.append([time.strftime("%H:%M:%S"), text])
 
 
 def admin_state():
-    """Everything the admin dashboard shows, as plain data."""
+    """Data for the admin dashboard."""
     with rooms_lock:
         rs = list(rooms.values())
     out = []
@@ -195,7 +161,7 @@ def admin_state():
 
 
 def web_extra(route, query):
-    """Extra HTTP routes: the admin dashboard (protected by the key printed at startup)."""
+    """Extra HTTP routes: the admin dashboard (needs the key printed at startup)."""
     if route not in ("/admin", "/admin/state"):
         return None
     if not hmac.compare_digest(query.get("key", "").encode(), ADMIN_KEY.encode()):
@@ -206,7 +172,7 @@ def web_extra(route, query):
 
 
 class Encoded:
-    """A message encoded once. The compressed variant is made only if some receiver wants it."""
+    """A message encoded once; the compressed version is only built if someone wants it."""
     def __init__(self, msg):
         self.type = msg.get("type")
         self.plain = encode_msg(msg)
@@ -221,8 +187,7 @@ class Encoded:
 
 
 class Delayer:
-    """Runs callbacks at a later time (one thread, a heap ordered by due time). Used by the chaos lab
-    to delay messages the way a slow link would."""
+    """Runs callbacks later, from one thread. The chaos lab uses it to delay messages."""
     def __init__(self):
         self.heap, self.cv, self.n = [], threading.Condition(), itertools.count()
         threading.Thread(target=self._run, daemon=True).start()
@@ -240,7 +205,7 @@ class Delayer:
                 _, _, fn, args = heapq.heappop(self.heap)
             try:
                 fn(*args)
-            except Exception as e:                 # a bad delayed message must not stop the clock
+            except Exception as e:
                 event(f"[chaos] delayed call failed: {e!r}", flush=True)
 
 
@@ -253,39 +218,38 @@ def chaos_delay(ch):
     return max(0.0, ch["delay"] + random.uniform(-ch["jitter"], ch["jitter"])) / 1000.0
 
 
-_CLOSE = object()   # writer-queue marker: flush everything before this, then close the connection
+_CLOSE = object()  # flush everything queued before this, then close
 
 
 class Client:
-    """One TCP connection. send() only enqueues; a dedicated writer thread does the blocking sendall."""
+    """One TCP connection. send() only queues; a writer thread does the blocking send."""
     def __init__(self, sock, addr):
         self.sock, self.addr = sock, addr
         self.user = None
         self.room = None
         self.alive = True
-        self.kind = "tcp"        # "tcp" desktop client, "web" browser (WebSocket), "replica" standby server
-        self.z = False           # peer said it understands compressed frames
-        self.in_due = self.out_due = 0.0   # chaos lab: when the previous delayed message is due (keeps order)
-        self.hi, self.lo = deque(), deque()   # outgoing frames: board traffic / disposable traffic
+        self.kind = "tcp"  # "tcp", "web" or "replica"
+        self.z = False
+        self.in_due = self.out_due = 0.0  # keeps delayed messages in order
+        self.hi, self.lo = deque(), deque()
         self.cv = threading.Condition()
-        self.queued = 0          # bytes waiting in both queues
-        self.tokens, self.tok_at = 0.0, time.time()      # outgoing byte bucket (chaos lab bandwidth cap)
-        self.in_tokens, self.in_at = float(TRANSIENT_BURST), time.time()   # incoming rate limiter
+        self.queued = 0
+        self.tokens, self.tok_at = 0.0, time.time()
+        self.in_tokens, self.in_at = float(TRANSIENT_BURST), time.time()
         threading.Thread(target=self._writer, daemon=True).start()
 
     def send(self, msg):
         self.send_enc(Encoded(msg))
 
     def frame_for(self, enc):
-        """The bytes this kind of connection puts on the wire for a message."""
+        """Encode a message the way this connection expects it."""
         frame = enc.wire(self.z)
         if frame is not enc.plain:
             stats.add(z_frames=1, z_saved=len(enc.plain) - len(frame))
         return frame
 
     def send_enc(self, enc):
-        """Queue a message. With the chaos lab on for this client's room the message may be dropped
-        or held back first, exactly as an unreliable, slow link would do."""
+        """Queue a message. If the chaos lab is on for this room it may be dropped or delayed first."""
         if not self.alive:
             return
         room, now, due = self.room, time.time(), 0.0
@@ -297,7 +261,7 @@ class Client:
                 return
             due = now + chaos_delay(ch)
         if due > now or self.out_due > now:
-            self.out_due = max(self.out_due, due)        # never overtake an earlier delayed message
+            self.out_due = max(self.out_due, due)
             if ch:
                 stats.add(chaos_delayed=1)
             delayer.at(self.out_due, self.send_frame, self.frame_for(enc), enc.type)
@@ -305,10 +269,9 @@ class Client:
             self.send_frame(self.frame_for(enc), enc.type)
 
     def send_frame(self, frame, mtype=None):
-        """Put a frame in this client's outgoing queue. Two priority classes: board traffic (ops, ACKs,
-        chat, ...) always goes before disposable traffic (cursor positions, live stroke previews, laser).
-        If the disposable class backs up, the OLDEST entries are thrown away: a newer cursor position
-        makes them worthless anyway."""
+        """Queue a frame. Board traffic always goes before cursor/preview/laser traffic,
+        and when the latter backs up the oldest entries are dropped.
+        """
         if not self.alive:
             return
         low = mtype in LOW_PRIO
@@ -340,8 +303,8 @@ class Client:
             self.cv.notify()
 
     def close_after_flush(self):
-        """Used for KICK: the goodbye message is sent first, then the socket is shut down."""
-        if self.out_due > time.time():                   # the goodbye itself is still being delayed
+        """Send a goodbye message, then close the connection (used for KICK)."""
+        if self.out_due > time.time():
             delayer.at(self.out_due, self._mark, _CLOSE)
         else:
             self._mark(_CLOSE)
@@ -349,7 +312,7 @@ class Client:
     def kill(self):
         self.alive = False
         try:
-            self.sock.shutdown(socket.SHUT_RDWR)    # also wakes up the reader thread
+            self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
         with self.cv:
@@ -357,18 +320,16 @@ class Client:
             self.cv.notify()
 
     def _throttle(self, n, mtype):
-        """Chaos lab bandwidth cap: a token bucket in bytes. Tokens drip in at the configured rate; a
-        frame may leave only when the bucket holds enough. Applied to board ops and disposable
-        traffic, so a narrow link shows the priority queue at work."""
+        """Token bucket for the chaos lab's bandwidth cap."""
         room = self.room
         ch = room.chaos if room is not None else None
         if not ch or not ch.get("bw") or mtype not in SHAPED:
             return
-        rate = ch["bw"] * 125.0                          # kbit/s -> bytes per second
+        rate = ch["bw"] * 125.0  # kbit/s -> bytes/s
         now = time.time()
-        self.tokens = min(rate * 0.5, self.tokens + (now - self.tok_at) * rate)   # bucket depth = 0.5 s
+        self.tokens = min(rate * 0.5, self.tokens + (now - self.tok_at) * rate)
         self.tok_at = now
-        self.tokens -= n                                 # may go negative: that debt is the waiting time
+        self.tokens -= n  # goes negative while waiting
         if self.tokens < 0:
             time.sleep(min(3.0, -self.tokens / rate))
 
@@ -385,13 +346,13 @@ class Client:
                 return
             self._throttle(len(frame), mtype)
             try:
-                self.sock.sendall(frame)      # may block (receiver's TCP window full) - only this thread waits
-            except socket.timeout:            # receiver accepted nothing for TIMEOUT_SEC: give up on it
+                self.sock.sendall(frame)  # can block, but only this thread waits
+            except socket.timeout:
                 stats.add(slow_drops=1)
                 event(f"[!] {self.addr} stopped reading - dropping it")
                 self.kill()
                 return
-            except OSError:                   # connection closed / reset
+            except OSError:
                 self.kill()
                 return
             with self.cv:
@@ -400,8 +361,7 @@ class Client:
 
 
 class WebClient(Client):
-    """A browser connected through WebSocket: same messages, but each one travels as a WebSocket
-    text frame instead of a length-prefixed frame (and without our own compression)."""
+    """A browser client: same messages, sent as WebSocket text frames."""
     def __init__(self, sock, addr):
         super().__init__(sock, addr)
         self.kind = "web"
@@ -411,45 +371,44 @@ class WebClient(Client):
 
 
 class Member:
-    """A participant record that survives disconnects (for reconnection)."""
+    """A room member. Survives disconnects so the user can reconnect."""
     def __init__(self, name, token, color, role):
         self.name, self.token, self.color, self.role = name, token, color, role
-        self.client = None                 # current live connection or None
-        self.undo, self.redo = [], []      # per-user action stacks
-        self.seen = deque(maxlen=500)      # recent msg_ids -> duplicate filter
-        self.next_rn = 1                   # next request number expected from this client
-        self.held = {}                     # rn -> request that arrived before an earlier one (reorder buffer)
-        self.rtt = None                    # latest round-trip time (ms) reported by this client
-        self.via = None                    # browser guest: the member whose invite link let it in
+        self.client = None  # None while offline
+        self.undo, self.redo = [], []
+        self.seen = deque(maxlen=500)
+        self.next_rn = 1
+        self.held = {}  # requests that arrived early
+        self.rtt = None
+        self.via = None  # set for browser guests: who invited them
 
 
 class Room:
     def __init__(self, code, password, host):
         self.code, self.password, self.host = code, password, host
         self.lock = threading.RLock()
-        self.log = []          # sequenced ops; log[i]["seq"] == i + 1
-        self.objects = {}      # id -> {"obj":..., "visible": bool}
-        self.members = {}      # name -> Member
-        self.banned = set()    # names kicked by the host (cannot rejoin, even with their token)
-        self.cfg = {"voice": False, "e2e": False}   # room switches only the host may flip (ROOM_SET)
-        self.image_bytes = 0   # base64 size of all images ever added (they are hidden, never deleted)
+        self.log = []  # log[i]["seq"] == i + 1
+        self.objects = {}
+        self.members = {}
+        self.banned = set()
+        self.cfg = {"voice": False, "e2e": False}
+        self.image_bytes = 0
         self.chat = []
-        self.versions = []     # version history: {"id","label","ts","seq","visible":[ids]}
+        self.versions = []
         self.next_version = 1
-        self.restoring = False  # no auto-snapshot half way through a restore
-        self.chaos = None       # chaos lab settings {"loss": %, "delay": ms, "jitter": ms} or None (not saved)
-        self.chaos_n = {"in": 0, "out": 0}    # messages dropped on purpose, per direction
-        self.qos = {"shed": 0, "limited": 0}  # disposable frames shed (slow link) / refused (sender too fast)
+        self.restoring = False
+        self.chaos = None
+        self.chaos_n = {"in": 0, "out": 0}
+        self.qos = {"shed": 0, "limited": 0}
 
     def take_version(self, label):
-        """Snapshot = the set of visible object ids (objects are never deleted, only hidden,
-        so ids are enough to restore any past state)."""
+        """Save a version: just the set of visible object ids, since objects are hidden rather than deleted."""
         v = {"id": self.next_version, "label": label, "ts": time.strftime("%H:%M:%S"),
              "seq": self.seq(), "visible": self.visible_ids()}
         self.next_version += 1
         self.versions.append(v)
         persist("add_version", self.code, v)
-        while len(self.versions) > MAX_VERSIONS:       # drop the oldest automatic one first
+        while len(self.versions) > MAX_VERSIONS:
             autos = [x for x in self.versions if x["label"].startswith("auto")]
             old = autos[0] if autos else self.versions[0]
             self.versions.remove(old)
@@ -460,7 +419,7 @@ class Room:
         return [{k: v[k] for k in ("id", "label", "ts", "seq")} | {"count": len(v["visible"])}
                 for v in reversed(self.versions)]
 
-    # ---- helpers (call with lock held) ----
+    # Helpers, call with the lock held
     def seq(self):
         return len(self.log)
 
@@ -470,11 +429,11 @@ class Room:
                 for m in self.members.values()]
 
     def users_msg(self):
-        """The participant list, plus the people the host removed (the host can let them back in)."""
+        """The participant list plus the people the host removed."""
         return {"type": "USERS", "users": self.users_payload(), "banned": sorted(self.banned)}
 
     def broadcast(self, msg, skip=None):
-        enc = Encoded(msg)                     # encode once, queue the same bytes for everyone
+        enc = Encoded(msg)
         for m in self.members.values():
             if m.client and m.client is not skip:
                 m.client.send_enc(enc)
@@ -484,7 +443,7 @@ class Room:
                 "objects": [{**o["obj"], "visible": o["visible"]} for o in self.objects.values()]}
 
     def commit(self, op):
-        """Assign the next seq, apply to state, broadcast. The ONE place state changes."""
+        """Assign the next seq, apply the op and broadcast it. All state changes go through here."""
         op["seq"] = self.seq() + 1
         op["type"] = "OP"
         stats.add(ops=1)
@@ -495,7 +454,7 @@ class Room:
             self.take_version(f"auto @op {len(self.log)}")
 
     def apply(self, op):
-        """Apply one sequenced op to the state (used live by commit() and when replaying the database)."""
+        """Apply one sequenced op (live, or when replaying the database)."""
         if op["op"] == "ADD":
             self.objects[op["obj"]["id"]] = {"obj": op["obj"], "visible": True}
             if op["obj"]["kind"] in ("image", "enc"):
@@ -508,7 +467,7 @@ class Room:
             for i in op["ids"]:
                 if i in self.objects:
                     o = self.objects[i]["obj"]
-                    # a NEW dict: the ADD op in the log keeps its original points, so replay stays exact
+                    # copy, so the logged ADD op keeps its original points
                     self.objects[i]["obj"] = {**o, "points": shift(o["points"], op["dx"], op["dy"])}
         self.log.append(op)
 
@@ -531,7 +490,7 @@ def new_code():
             return c
 
 
-# ------------------------------------------------------------------ handlers
+# Handlers
 def valid_obj(o):
     try:
         if o["kind"] not in KINDS or not COLOR_RE.match(o["color"]):
@@ -545,7 +504,7 @@ def valid_obj(o):
             return False
         if o["kind"] == "sticky" and (len(pts) != 1 or len(str(o.get("text", ""))) > 300):
             return False
-        if o["kind"] == "enc":          # ciphertext only: the server cannot look inside (see e2e.py)
+        if o["kind"] == "enc":
             d = o.get("data")
             return len(pts) == 1 and isinstance(d, str) and 64 <= len(d) <= MAX_ENC_B64
         if o["kind"] == "image":
@@ -570,7 +529,7 @@ def push_action(m, kind, ids, **extra):
 def handle(client, msg):
     room, t = client.room, msg.get("type")
     if t == "PING":
-        # Echo the client's timestamp so it can compute RTT; piggyback live server/room statistics.
+        # Echo the timestamp so the client can measure RTT, plus some live stats.
         reply = {"type": "PONG", "t": msg.get("t"), "stats": stats.snapshot(), "web": WEB}
         if room is not None:
             with room.lock:
@@ -588,14 +547,16 @@ def handle(client, msg):
         return
     with room.lock:
         m = room.members.get(client.user)
-        if m is None or m.client is not client:      # kicked, or replaced by a newer connection
+        if m is None or m.client is not client:
             return
         mid = msg.get("msg_id")
         rn = msg.get("rn")
-        if mid and isinstance(rn, int):           # numbered request: process strictly in rn order
-            if rn > m.next_rn:                    # an earlier request was lost on the way: hold this one
-                stats.add(out_of_order=1)         # back (no ACK yet) until the client's retransmit timer
-                if len(m.held) < 256:             # has filled the gap - like TCP's out-of-order queue
+        # Handle numbered requests strictly in order. If one is missing, hold the
+        # later ones until the client resends it.
+        if mid and isinstance(rn, int):
+            if rn > m.next_rn:
+                stats.add(out_of_order=1)
+                if len(m.held) < 256:
                     m.held[rn] = msg
                 return
             if rn == m.next_rn:
@@ -608,12 +569,12 @@ def handle(client, msg):
 
 
 def process(client, room, m, msg):
-    """Duplicate filter, then the request itself, then the ACK. Called with room.lock held."""
+    """Duplicate filter, then the request, then the ACK. Called with room.lock held."""
     mid = msg.get("msg_id")
     if mid:
         if mid in m.seen:
             stats.add(dups=1)
-            client.send({"type": "ACK", "msg_id": mid, "dup": True})   # ack again so it stops resending
+            client.send({"type": "ACK", "msg_id": mid, "dup": True})  # ACK again so it stops resending
             return
         m.seen.append(mid)
     apply_request(client, room, m, msg.get("type"), msg, mid)
@@ -657,7 +618,7 @@ def apply_request(client, room, m, t, msg, mid):
         if ids:
             room.commit({"op": "VIS", "ids": ids, "visible": False, "by": m.name, "msg_id": mid})
             push_action(m, "erase", ids)
-    elif t == "MOVE" and can_edit:              # select-and-drag: shift objects (any editor may move any object)
+    elif t == "MOVE" and can_edit:
         try:
             dx, dy = round(float(msg.get("dx", 0))), round(float(msg.get("dy", 0)))
         except (TypeError, ValueError, OverflowError):
@@ -679,27 +640,26 @@ def apply_request(client, room, m, t, msg, mid):
         if src:
             act = src.pop()
             dst.append(act)
-            if act["kind"] == "move":               # undo moves back, redo moves again
+            if act["kind"] == "move":
                 sign = -1 if t == "UNDO" else 1
                 room.commit({"op": "MOVE", "ids": act["ids"], "dx": sign * act["dx"], "dy": sign * act["dy"],
                              "by": m.name, "msg_id": mid})
             else:
-                # undo of ADD hides, undo of ERASE shows; redo is the reverse
                 hide = (act["kind"] == "add") == (t == "UNDO")
                 room.commit({"op": "VIS", "ids": act["ids"], "visible": not hide, "by": m.name, "msg_id": mid})
-    elif t == "LIVE" and can_edit:             # transient stroke preview, not stored
+    elif t == "LIVE" and can_edit:
         room.broadcast({"type": "LIVE", "user": m.name, "color": msg.get("color"),
                         "width": msg.get("width"), "points": msg.get("points", [])[-50:]}, skip=client)
     elif t == "CURSOR":
         room.broadcast({"type": "CURSOR", "user": m.name, "x": msg.get("x"), "y": msg.get("y")}, skip=client)
-    elif t == "LASER":                         # laser pointer: transient, shown for a moment by everyone else
+    elif t == "LASER":
         room.broadcast({"type": "LASER", "user": m.name, "x": msg.get("x"), "y": msg.get("y")}, skip=client)
-    elif t == "CHAOS_SET" and is_host:         # chaos lab: emulate a bad link for this room
+    elif t == "CHAOS_SET" and is_host:
         try:
             ch = {"loss": min(60.0, max(0.0, float(msg.get("loss", 0)))),
                   "delay": min(1000.0, max(0.0, float(msg.get("delay", 0)))),
                   "jitter": min(500.0, max(0.0, float(msg.get("jitter", 0)))),
-                  "bw": min(2000.0, max(0.0, float(msg.get("bw", 0))))}     # kbit/s per client, 0 = no cap
+                  "bw": min(2000.0, max(0.0, float(msg.get("bw", 0))))}  # 0 = no cap
             if 0 < ch["bw"] < 8:
                 ch["bw"] = 8.0
         except (TypeError, ValueError):
@@ -710,7 +670,7 @@ def apply_request(client, room, m, t, msg, mid):
             room.qos = {"shed": 0, "limited": 0}
         event(f"[chaos] room {room.code}: {room.chaos or 'off'}", flush=True)
         room.broadcast({"type": "CHAOS", "chaos": room.chaos, "by": m.name})
-    elif t == "FILE_OFFER":                    # peer-to-peer file transfer: we only introduce the two clients
+    elif t == "FILE_OFFER":  # we only introduce the two clients to each other
         tgt = room.members.get(msg.get("to"))
         if not tgt or not tgt.client or tgt.client.kind != "tcp" or client.kind != "tcp" or tgt is m:
             client.send({"type": "ERROR", "text": "File not offered: pick a participant who is online in the "
@@ -719,13 +679,13 @@ def apply_request(client, room, m, t, msg, mid):
         try:
             offer = {"type": "FILE_OFFER", "from": m.name, "id": str(msg["id"])[:64], "name": str(msg["name"])[:200],
                      "size": int(msg["size"]), "sha": str(msg["sha"])[:64], "port": int(msg["port"]),
-                     "ip": client.addr[0]}                      # the sender's address as WE see it
+                     "ip": client.addr[0]}
         except (KeyError, TypeError, ValueError):
             return
         stats.add(file_offers=1)
         event(f"[file] {m.name} offers '{offer['name']}' ({offer['size']} bytes) to {tgt.name} - peer to peer")
         tgt.client.send(offer)
-    elif t == "FILE_REPLY":                    # accepted / declined / received: passed back to the sender
+    elif t == "FILE_REPLY":
         tgt = room.members.get(msg.get("to"))
         if tgt and tgt.client:
             tgt.client.send({"type": "FILE_REPLY", "from": m.name, "id": str(msg.get("id"))[:64],
@@ -733,10 +693,10 @@ def apply_request(client, room, m, t, msg, mid):
         if msg.get("status") == "received":
             room.broadcast({"type": "INFO", "text": f"{m.name} received a file from {msg.get('to')} "
                                                     f"directly (peer to peer): {str(msg.get('text', ''))[:200]}"})
-    elif t == "REPLAY_REQ":                    # time travel: the whole sequenced op log
+    elif t == "REPLAY_REQ":
         client.send({"type": "REPLAY", "ops": room.log})
-    elif t == "INVITE_REQ":                    # a signed, short-lived link that lets a browser join this room
-        if m.via:                              # a guest cannot hand out links of its own (no way round the limit)
+    elif t == "INVITE_REQ":
+        if m.via:
             client.send({"type": "ERROR", "text": "Guests who joined through a link cannot invite others"})
         else:
             client.send({"type": "INVITE", **make_invite(room, m.name)})
@@ -759,16 +719,16 @@ def apply_request(client, room, m, t, msg, mid):
     elif t == "KICK" and is_host:
         tgt = room.members.get(msg.get("user"))
         if tgt and tgt.name != room.host:
-            room.banned.add(tgt.name)          # its saved token no longer gets it back in
+            room.banned.add(tgt.name)
             del room.members[tgt.name]
             persist("ban", room.code, tgt.name)
             if tgt.client:
                 tgt.client.send({"type": "KICKED", "text": "You were removed from the room by the host"})
-                tgt.client.room = None         # its connection no longer belongs to the room
+                tgt.client.room = None
                 tgt.client.close_after_flush()
             room.broadcast(room.users_msg())
             room.broadcast({"type": "INFO", "text": f"{tgt.name} was removed by the host"})
-    elif t == "UNBAN" and is_host:             # the host lets a removed person back in
+    elif t == "UNBAN" and is_host:
         name = str(msg.get("user", ""))
         if name in room.banned:
             room.banned.discard(name)
@@ -776,14 +736,14 @@ def apply_request(client, room, m, t, msg, mid):
             event(f"[room {room.code}] {name} may join again (host lifted the removal)")
             room.broadcast(room.users_msg())
             room.broadcast({"type": "INFO", "text": f"{name} may join again (allowed back by the host)"})
-    elif t == "ROOM_SET" and is_host:          # room switches: voice chat and end-to-end encryption
+    elif t == "ROOM_SET" and is_host:
         changed = {k: bool(msg[k]) for k in ("voice", "e2e") if k in msg and bool(msg[k]) != room.cfg[k]}
         if changed:
             room.cfg.update(changed)
             persist("set_cfg", room.code, dict(room.cfg))
             room.broadcast({"type": "ROOM", "cfg": room.cfg, "by": m.name})
             if changed.get("voice") is False and RELAY is not None:
-                RELAY.drop_room(room.code)             # whoever is talking is cut off right away
+                RELAY.drop_room(room.code)
             for k, label in (("voice", "voice chat"), ("e2e", "end-to-end encryption")):
                 if k in changed:
                     room.broadcast({"type": "INFO", "text": f"The host turned {label} {'ON' if changed[k] else 'off'} "
@@ -833,7 +793,7 @@ def apply_request(client, room, m, t, msg, mid):
             room.commit({"op": "VIS", "ids": ids, "visible": False, "by": m.name})
         skipped = 0
         for o in data["objects"]:
-            o = dict(o, id="L" + uuid.uuid4().hex)      # fresh id (the old one may still exist, hidden)
+            o = dict(o, id="L" + uuid.uuid4().hex)  # fresh id, the old one may still exist hidden
             if valid_obj(o) and room.image_fits(o):
                 room.commit({"op": "ADD", "obj": o, "by": m.name})
             else:
@@ -843,7 +803,7 @@ def apply_request(client, room, m, t, msg, mid):
 
 
 def my_rooms(name):
-    """Rooms this account belongs to (shown on the login screen)."""
+    """Rooms this account is a member of (for the login screen)."""
     with rooms_lock:
         rs = list(rooms.values())
     out = []
@@ -857,7 +817,7 @@ def my_rooms(name):
 
 
 def account(client, msg):
-    """REGISTER / LOGIN -> AUTH_OK with a JWT, or AUTH_ERR. MY_ROOMS (with a JWT) -> ROOMS."""
+    """REGISTER / LOGIN -> AUTH_OK with a JWT or AUTH_ERR. MY_ROOMS -> ROOMS."""
     t, ip = msg.get("type"), client.addr[0]
 
     def err(text):
@@ -879,7 +839,7 @@ def account(client, msg):
             return err("Username must be 3-20 characters: letters, digits, . _ -")
         if len(pw) < MIN_PASSWORD:
             return err(f"Password must be at least {MIN_PASSWORD} characters")
-        h = hash_password(pw)                 # slow on purpose (~0.1 s); done outside every lock
+        h = hash_password(pw)
         with users_lock:
             if name.lower() in users:
                 return err("That username is already registered - log in instead")
@@ -905,7 +865,7 @@ def backups_payload():
 
 
 def announce_backups():
-    """Tell every connected client where the standby servers are (they switch to one if we die)."""
+    """Tell every client where the standby servers are, so they can fail over."""
     msg = {"type": "BACKUPS", "backups": backups_payload()}
     with rooms_lock:
         rs = list(rooms.values())
@@ -915,8 +875,7 @@ def announce_backups():
 
 
 def voice_auth(room_code, user, token):
-    """Voice relay: only an online member of the room, proving it with its member token - and only
-    while the host has voice chat switched on for the room."""
+    """Voice relay check: an online member with a valid token, and voice turned on by the host."""
     r = rooms.get(str(room_code).upper())
     if r is None or ROLE != "primary" or not r.cfg["voice"]:
         return False
@@ -930,10 +889,9 @@ def voice_loss(room_code):
 
 
 def make_invite(room, by):
-    """Invite link for browsers: a JWT that names the room AND the member who asked for it, signed with
-    the server secret. Whoever holds it may join THAT room as a guest for one hour - no password travels
-    over plain HTTP. Every link of one member counts against that member: at most INVITE_DEVICES of
-    their guests can be connected at the same time, however often the link or QR code is shared."""
+    """Build an invite link for browsers: a JWT for this room and the member who asked for it,
+    valid for an hour. At most INVITE_DEVICES guests can be connected through one member's links.
+    """
     exp = int(time.time()) + 3600
     tok = jwt_encode({"kind": "invite", "room": room.code, "by": by, "exp": exp, "iss": "lan-whiteboard"}, jwt_secret)
     url = f"http://{lan_ip()}:{WEB}/?room={room.code}&invite={tok}" if WEB else None
@@ -943,7 +901,7 @@ def make_invite(room, by):
 
 def guest_name(raw):
     name = re.sub(r"[^A-Za-z0-9_.-]", "", str(raw or ""))[:14] or "guest"
-    return name + " (web)"        # accounts cannot contain a space or brackets, so a guest never clashes with one
+    return name + " (web)"  # account names can't contain spaces or brackets, so no clash
 
 
 def join(client, msg):
@@ -953,7 +911,7 @@ def join(client, msg):
                      "text": "This server is a standby backup; it takes over only if the main server stops"})
         return False
     guest, inviter = False, None
-    if msg.get("invite"):          # browser guest: the signed invite proves the right to enter one room
+    if msg.get("invite"):
         try:
             claims = jwt_decode(str(msg["invite"]), jwt_secret)
             if claims.get("kind") != "invite" or msg["type"] != "JOIN_ROOM":
@@ -965,7 +923,7 @@ def join(client, msg):
             return False
         guest, user, inviter = True, guest_name(msg.get("user")), str(claims["by"])
         msg = dict(msg, room=claims["room"])
-    elif AUTH:                     # identity comes from the verified token, never from the "user" field
+    elif AUTH:  # name comes from the verified token
         try:
             claims = jwt_decode(str(msg.get("jwt", "")), jwt_secret)
             if claims.get("kind") == "invite" or not claims.get("sub"):
@@ -998,7 +956,7 @@ def join(client, msg):
                          "text": "You were removed from this room by the host"})
             return False
         if guest:
-            if inviter not in room.members:               # the member who shared the link was removed
+            if inviter not in room.members:
                 client.send({"type": "JOIN_ERR", "code": "AUTH", "text": f"This invite link is no longer valid: "
                              f"{inviter} is not a member of the room any more. Ask for a new link."})
                 return False
@@ -1012,8 +970,8 @@ def join(client, msg):
                                      "phones/browsers: close one of them, or ask someone else in the room for their link."})
                 return False
         m = room.members.get(user)
-        proven = AUTH and not guest                       # the JWT already proved who this is
-        if m and (proven or m.token == msg.get("token")):   # same identity -> (re)connect
+        proven = AUTH and not guest
+        if m and (proven or m.token == msg.get("token")):
             if m.client:
                 m.client.kill()
         else:
@@ -1033,7 +991,7 @@ def join(client, msg):
         if m.token == msg.get("token") and msg.get("token"):
             stats.add(reconnects=1)
         m.client = client
-        m.next_rn, m.held = 1, {}                         # the client numbers its requests from 1 again
+        m.next_rn, m.held = 1, {}
         client.z = bool(msg.get("z")) and client.kind == "tcp"
         client.user, client.room = user, room
         client.send({"type": "JOIN_OK", "room": room.code, "user": user, "token": m.token,
@@ -1050,7 +1008,7 @@ def join(client, msg):
 
 
 def dispatch(client, msg):
-    """One received message, whatever transport it arrived on (TCP frame or WebSocket frame)."""
+    """Handle one received message, from either TCP or WebSocket."""
     t = msg.get("type")
     if client.kind == "replica":
         if t == "PING":
@@ -1073,11 +1031,11 @@ def dispatch(client, msg):
 
 
 def incoming(client, msg):
-    """Chaos lab hook for client -> server messages: maybe drop, maybe delay, then dispatch."""
+    """Chaos lab hook for incoming messages: maybe drop, maybe delay, then dispatch."""
     if not isinstance(msg, dict):
         return
     room, now, due = client.room, time.time(), 0.0
-    if msg.get("type") in LOW_PRIO:                     # token bucket: at most TRANSIENT_RATE per second
+    if msg.get("type") in LOW_PRIO:
         client.in_tokens = min(TRANSIENT_BURST, client.in_tokens + (now - client.in_at) * TRANSIENT_RATE)
         client.in_at = now
         if client.in_tokens < 1:
@@ -1087,7 +1045,7 @@ def incoming(client, msg):
             return
         client.in_tokens -= 1
     ch = room.chaos if room is not None else None
-    if ch and msg.get("type") != "CHAOS_SET":           # the host must always be able to turn it off
+    if ch and msg.get("type") != "CHAOS_SET":
         if (msg.get("type") in LOSSY_IN or msg.get("msg_id")) and random.random() * 100 < ch["loss"]:
             stats.add(chaos_drops=1)
             room.chaos_n["in"] += 1
@@ -1105,7 +1063,7 @@ def client_gone(client):
     if room:
         with room.lock:
             m = room.members.get(client.user)
-            if m and m.client is client:        # not already replaced by a reconnect
+            if m and m.client is client:
                 m.client = None
                 room.broadcast(room.users_msg())
                 room.broadcast({"type": "INFO", "text": f"{client.user} left"})
@@ -1118,10 +1076,10 @@ def client_gone(client):
 
 
 def serve_client(sock, addr):
-    sock.settimeout(TIMEOUT_SEC)            # silent for 15s => treated as disconnected (also bounds sendall)
+    sock.settimeout(TIMEOUT_SEC)
     if tls_ctx is not None:
-        try:                                # TLS handshake here, not in the accept loop, so a slow peer
-            sock = tls_ctx.wrap_socket(sock, server_side=True)   # cannot hold up other connections
+        try:  # do the TLS handshake here so a slow client can't block accept()
+            sock = tls_ctx.wrap_socket(sock, server_side=True)
         except (ssl.SSLError, OSError) as e:
             stats.add(tls_fails=1)
             event(f"[!] {addr} TLS handshake failed ({e}); is the client set to 'Encrypted'?")
@@ -1144,8 +1102,7 @@ def serve_client(sock, addr):
 
 
 def serve_websocket(sock, addr):
-    """Called by web.py after the HTTP -> WebSocket handshake. Same loop as serve_client, but each
-    message is one WebSocket frame."""
+    """Called by web.py after the WebSocket handshake. Same as serve_client, one message per frame."""
     stats.add(conns=1, web_conns=1)
     event(f"[+] {addr} connected (browser, WebSocket)")
     client = WebClient(sock, addr)
@@ -1163,12 +1120,11 @@ def serve_websocket(sock, addr):
         event(f"[-] {addr} disconnected (browser)")
 
 
-# ------------------------------------------------------------------ replication (hot standby)
+# Replication (hot standby)
 def repl_hello(client, msg):
-    """A standby server asks for the data. After checking the cluster key: register it (from now on it
-    receives every change), then send it the current state room by room. A room is copied while holding
-    its lock, and changes are forwarded while holding the same lock, so the standby can never miss or
-    double-apply an op: whatever was queued for it before the copy is already inside the copy."""
+    """A standby asks for the data. Check the cluster key, register it, then copy each room
+    under its lock. Changes are forwarded under the same lock, so nothing is missed or applied twice.
+    """
     if not CLUSTER_KEY or not hmac.compare_digest(str(msg.get("key", "")).encode(), CLUSTER_KEY.encode()):
         client.send({"type": "REPL_ERR", "text": "wrong or missing cluster key (start both servers with "
                                                  "the same --cluster-key)"})
@@ -1196,7 +1152,7 @@ def repl_hello(client, msg):
 
 
 def apply_repl(msg):
-    """Standby side: apply one message of the replication stream to memory and to our own database."""
+    """Standby side: apply one replication message to memory and our own database."""
     global jwt_secret
     t = msg["type"]
     if t == "REPL_BEGIN":
@@ -1250,12 +1206,12 @@ def apply_repl(msg):
                 rooms[r.code] = r
             return persist(m, r)
         r = rooms.get(a[0])
-        if r is None:                  # a room we have not been given yet: its full copy is on the way
+        if r is None:  # full copy of this room is still on its way
             return
         with r.lock:
             if m == "add_op":
                 op = a[1]
-                if op["seq"] != r.seq() + 1:          # already inside the copy we received
+                if op["seq"] != r.seq() + 1:
                     return
                 r.apply(op)
                 if op.get("msg_id") and op.get("by") in r.members:
@@ -1287,9 +1243,9 @@ def apply_repl(msg):
 
 
 def standby_loop(host, port, use_tls, my_port, my_fp):
-    """Standby side: stay connected to the primary, apply its stream, and take over when it is gone.
-    The primary counts as dead when the connection breaks (or stays silent for 4 s) AND two
-    reconnect attempts in a row fail."""
+    """Standby side: follow the primary and take over when it's gone (connection lost or
+    silent for 4 s, and two reconnects in a row fail).
+    """
     global ROLE
     synced, fails = False, 0
     while ROLE == "standby":
@@ -1306,7 +1262,7 @@ def standby_loop(host, port, use_tls, my_port, my_fp):
             s.settimeout(1.0)
             fails, last, pinged = 0, time.time(), 0.0
             while True:
-                if time.time() - pinged >= 1:                 # heartbeat, once a second
+                if time.time() - pinged >= 1:
                     pinged = time.time()
                     send_msg(s, {"type": "PING", "t": pinged * 1000})
                 try:
@@ -1349,7 +1305,7 @@ def standby_loop(host, port, use_tls, my_port, my_fp):
 
 
 def restore_rooms():
-    """Rebuild every saved room from the database by replaying its op log."""
+    """Rebuild every saved room from the database."""
     n_ops = 0
     for d in store.load():
         r = Room(d["code"], d["password"], d["host"])
@@ -1358,12 +1314,13 @@ def restore_rooms():
         r.banned = set(d["banned"])
         r.cfg.update({k: bool(v) for k, v in d.get("cfg", {}).items() if k in r.cfg})
         for op in d["ops"]:
-            if op["seq"] != r.seq() + 1:          # never expected; stop rather than build a wrong board
+            if op["seq"] != r.seq() + 1:
                 event(f"[db] room {r.code}: op log has a gap at seq {op['seq']}, stopping replay there")
                 break
             r.apply(op)
-            if op.get("msg_id") and op.get("by") in r.members:   # rebuild the duplicate filters, so a
-                r.members[op["by"]].seen.append(op["msg_id"])    # client resending after the restart is ignored
+            # rebuild the duplicate filters so resends after a restart are ignored
+            if op.get("msg_id") and op.get("by") in r.members:
+                r.members[op["by"]].seen.append(op["msg_id"])
         n_ops += r.seq()
         r.chat = []
         for ts, user, text, mid in d["chat"]:
@@ -1376,12 +1333,11 @@ def restore_rooms():
     return len(rooms), n_ops
 
 
-WEB_PORT_TRIES = 10       # the web listener tries this many ports, starting at --web-port
+WEB_PORT_TRIES = 10
 
 
 def web_is_ours(port, token):
-    """Ask the web port for /info and check that the answer comes from THIS process. If another program
-    answers there (two listeners on one port, possible on Windows), phones would get its page, not ours."""
+    """Check that the web port is answered by this process and not some other program."""
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
             s.settimeout(2)
@@ -1398,9 +1354,9 @@ def web_is_ours(port, token):
 
 
 def start_web(host, first_port, name):
-    """Start the HTTP + WebSocket listener on the first usable port from `first_port` on.
-    A port is skipped when another program already listens on it, or when a request to it is not
-    answered by us. Returns the port, or None if none of them could be used."""
+    """Start the web listener on the first usable port from `first_port` up.
+    Returns the port, or None if none worked.
+    """
     token = secrets.token_hex(8)
     info = lambda: {"name": name, "auth": AUTH, "role": ROLE, "id": token}
     loop_host = host if host not in ("0.0.0.0", "", "::") else None
@@ -1411,7 +1367,7 @@ def start_web(host, first_port, name):
         except OSError as e:
             event(f"[!] Web port {port} not available ({e})", flush=True)
             continue
-        if loop_host is not None or web_is_ours(port, token):    # (bound to one address: cannot ask via loopback)
+        if loop_host is not None or web_is_ours(port, token):
             return port
         event(f"[!] Web port {port}: another program answers there", flush=True)
         srv.close()
@@ -1421,7 +1377,7 @@ def start_web(host, first_port, name):
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("10.255.255.255", 1))      # no packet sent; just picks the LAN interface
+        s.connect(("10.255.255.255", 1))  # doesn't send anything, just picks the LAN interface
         return s.getsockname()[0]
     except OSError:
         return "127.0.0.1"
@@ -1430,7 +1386,7 @@ def lan_ip():
 
 
 def ipv6_addresses():
-    """This machine's IPv6 addresses (for the startup banner)."""
+    """This machine's IPv6 addresses, for the startup banner."""
     out = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6):
@@ -1443,11 +1399,10 @@ def ipv6_addresses():
 
 
 def discovery_loop(udp_port, tcp_port, name):
-    """UDP service discovery: answer every DISCOVER broadcast with our TCP port.
-    The client learns our IP address from the source address of the reply datagram."""
+    """Answer LAN discovery broadcasts with our TCP port."""
     server_id = uuid.uuid4().hex[:8]
     u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # several servers on one PC (e.g. tests)
+    u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         u.bind(("", udp_port))
     except OSError as e:
@@ -1467,14 +1422,14 @@ def discovery_loop(udp_port, tcp_port, name):
                  "tls": tls_ctx is not None, "auth": AUTH, "role": ROLE, "web": WEB,
                  "ip": lan_ip(), "rooms": len(rs), "users": online}
         try:
-            u.sendto(json.dumps(reply).encode("utf-8"), addr)    # unicast back to whoever asked
+            u.sendto(json.dumps(reply).encode("utf-8"), addr)
             stats.add(discovery=1)
         except OSError:
             pass
 
 
 def stats_loop():
-    """Console summary every 10 s: clients, traffic, per-user latency."""
+    """Print a summary every 10 s: clients, traffic, latency."""
     last = stats.snapshot()
     while True:
         time.sleep(10)
@@ -1499,7 +1454,7 @@ def stats_loop():
 
 
 def _stop(*_):
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a second signal must not interrupt the final save
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise KeyboardInterrupt
 
 
@@ -1535,7 +1490,7 @@ def main():
             ap.error("--standby-of needs --cluster-key (the same value as on the main server)")
         ROLE = "standby"
         if a.db == "whiteboard.db":
-            a.db = "whiteboard-standby.db"     # never touch the main server's file when both run in one folder
+            a.db = "whiteboard-standby.db"
     if not a.no_db:
         store = Store(a.db, on_write=lambda n: stats.add(db_writes=n))
         if ROLE == "standby":
@@ -1611,8 +1566,8 @@ def main():
     if not a.no_discovery:
         threading.Thread(target=discovery_loop, args=(a.discovery_port, a.port, a.name), daemon=True).start()
         print(f"LAN discovery: answering on UDP {a.discovery_port} (clients can press 'Find servers')")
-    srv.settimeout(1.0)                        # wake up every second so Ctrl+C works on Windows too
-    signal.signal(signal.SIGTERM, _stop)       # "kill" / terminate() also saves cleanly
+    srv.settimeout(1.0)  # lets Ctrl+C work on Windows
+    signal.signal(signal.SIGTERM, _stop)
     try:
         while True:
             try:
@@ -1629,7 +1584,7 @@ def main():
         print("Stopping server...")
     finally:
         if store is not None:
-            store.flush()                      # make sure the last writes reach the disk
+            store.flush()
 
 
 if __name__ == "__main__":

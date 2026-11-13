@@ -1,9 +1,7 @@
-"""The browser client: one self-contained HTML page (no external files, works fully offline).
+"""The browser/phone client: a single HTML page served by web.py.
 
-It is kept inside a Python string so the PyInstaller .exe needs no data files. The page speaks the
-same JSON protocol as the desktop client, carried in WebSocket text frames (see web.py), including the
-reliability rules: sequence numbers with gap resync, msg_id + ACK, a retransmit timer,
-heartbeat PING/PONG with latency, and automatic reconnect (also to a standby server).
+Kept in a Python string so the .exe needs no data files. It speaks the same JSON protocol
+as the desktop client over a WebSocket, with the same ACK, resend and reconnect rules.
 """
 
 PAGE = r"""<!doctype html>
@@ -64,13 +62,13 @@ let ws = null, joined = false, dead = false, me = "", room = "", role = "editor"
 let users = [], objs = new Map(), lastSeq = 0, resyncing = false, resyncAt = 0, seqAtPong = -1;
 let outbox = [], rn = 0, rto = 800, tries = 0, rtt = null, rtts = [];
 let tool = "pen", color = "#000000", width = 3, cur = null, live = {}, cursors = {}, lasers = {}, imgs = {};
-let drag = null, nudge = {};     // select tool: objects being dragged {ids, x0, y0, dx, dy}; my moves not yet ACKed (id -> offset)
-let sel = new Set(), band = null;  // select tool: selected object ids; selection rectangle being dragged over empty board
+let drag = null, nudge = {};     // current drag; my moves waiting for an ACK (id -> offset)
+let sel = new Set(), band = null;  // selected ids; selection rectangle
 let hosts = [location.host], hostIdx = 0, opened = false, dirty = true, lastLive = 0, lastCur = 0, erased = new Set();
 const uid = () => Array.from({length: 4}, () => Math.random().toString(16).slice(2, 10)).join("");
 const now = () => Date.now();
 
-// ---------------------------------------------------------------- connection
+// Connection
 function joinMsg() {
   const m = {type: "JOIN_ROOM", user: $("name").value.trim(), room: (Q.get("room") || $("room").value).trim().toUpperCase(),
              password: $("rpw").value, token: token};
@@ -93,15 +91,15 @@ function retry() {
   ws = null;
   if (dead) return;
   if (!joined) { if (!$("err").textContent) $("err").textContent = "Cannot reach the server."; $("go").disabled = false; return; }
-  if (!opened) hostIdx++;                        // that server did not answer: try the next one (standby)
+  if (!opened) hostIdx++;                        // no answer, try the next server (standby)
   $("lat").textContent = "● reconnecting…"; $("lat").style.color = "var(--bad)";
   setTimeout(connect, 1000);
 }
 function raw(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
-// Reliable request: numbered (rn), kept in the outbox until the server ACKs its msg_id.
+// Requests stay in the outbox until the server ACKs them.
 function rel(m) { m.msg_id = uid(); m.rn = ++rn; outbox.push(m); if (outbox.length === 1) { sentAt = now(); tries = 0; } raw(m); }
 let sentAt = 0;
-setInterval(() => {                               // retransmit timer: resend everything unACKed, in order
+setInterval(() => {                               // retransmit timer
   if (!joined || !ws || ws.readyState !== 1) return;
   const t = now();
   if (outbox.length && t - sentAt > rto * Math.min(8, 2 ** tries)) { outbox.forEach(raw); sentAt = t; tries++; }
@@ -123,11 +121,11 @@ function handle(m) {
       if (!joined) { joined = true; $("join").style.display = "none"; $("app").style.display = "flex"; $("log").innerHTML = ""; m.chat.forEach(chatLine); }
       $("sroom").textContent = room; $("sme").textContent = me + (role === "viewer" ? " (view only)" : "");
       snapshot(m.snapshot); showUsers(); showChaos(m.chaos); setBackups(m.backups);
-      outbox.forEach((x, i) => { x.rn = i + 1; }); rn = outbox.length;      // new connection: renumber, resend
+      outbox.forEach((x, i) => { x.rn = i + 1; }); rn = outbox.length;      // new connection: renumber and resend
       outbox.forEach(raw); sentAt = now(); tries = 0;
       break;
     case "ACK": outbox = outbox.filter(x => x.msg_id !== m.msg_id); sentAt = now(); tries = 0;
-      for (const i in nudge) if (nudge[i].mid === m.msg_id) { delete nudge[i]; dirty = true; }   // server position from now on
+      for (const i in nudge) if (nudge[i].mid === m.msg_id) { delete nudge[i]; dirty = true; }
       break;
     case "OP": applyOp(m); break;
     case "OPS_SINCE": resyncing = false; m.ops.forEach(applyOp); break;
@@ -135,7 +133,7 @@ function handle(m) {
     case "PONG":
       if (m.t != null) { rtt = Math.max(0, now() - m.t); rtts.push(rtt); if (rtts.length > 20) rtts.shift();
         rto = Math.min(3000, Math.max(600, 3 * rtts.reduce((a, b) => a + b, 0) / rtts.length)); showLat(); }
-      if (m.stats && m.stats.room_seq > lastSeq && !resyncing) {            // heartbeat anti-entropy
+      if (m.stats && m.stats.room_seq > lastSeq && !resyncing) {            // behind the server, ask for what we missed
         if (seqAtPong === lastSeq) { resyncing = true; resyncAt = now(); raw({type: "RESYNC_REQ", since: lastSeq}); }
         seqAtPong = lastSeq;
       } else seqAtPong = -1;
@@ -163,37 +161,37 @@ function showChaos(c) {
   if (c) el.textContent = "⚡ Chaos lab: " + c.loss + "% loss, " + c.delay + " ms delay ± " + c.jitter + " ms" + (c.bw ? ", " + c.bw + " kbit/s cap" : "") + " — the board repairs itself";
 }
 $("exit").onclick = () => exitRoom();
-function exitRoom() {          // leave the room: frees this device's place under the invite (at most 2 per person)
+function exitRoom() {          // also frees this phone's place under the invite
   if (!confirm("Leave room " + room + "?")) return;
   dead = true; if (ws) ws.close();
-  location.reload();             // back to the join form; the invite link stays in the address bar
+  location.reload();             // back to the join form, the invite link stays in the URL
 }
 function showUsers() { $("susers").textContent = users.filter(u => u.online).length + " online"; }
 function sys(t) { const d = document.createElement("div"); d.className = "sys"; d.textContent = t; $("log").appendChild(d); $("log").scrollTop = 1e9; }
 function chatLine(c) { const d = document.createElement("div"); d.textContent = "[" + c.ts + "] " + c.user + ": " + c.text; $("log").appendChild(d); $("log").scrollTop = 1e9; }
 
-// ---------------------------------------------------------------- board state (same rules as the desktop client)
+// Board state
 function snapshot(s) {
   objs = new Map(); s.objects.forEach(o => objs.set(o.id, {obj: o, visible: o.visible}));
   lastSeq = s.seq; resyncing = false; live = {}; erased.clear(); dirty = true;
 }
 function applyOp(op) {
-  if (op.seq <= lastSeq) return;                          // duplicate
-  if (op.seq !== lastSeq + 1) {                           // gap: ask for what we missed
+  if (op.seq <= lastSeq) return;                          // already have it
+  if (op.seq !== lastSeq + 1) {                           // missed something
     if (!resyncing) { resyncing = true; resyncAt = now(); raw({type: "RESYNC_REQ", since: lastSeq}); }
     return;
   }
   lastSeq = op.seq;
   if (op.op === "ADD") { objs.set(op.obj.id, {obj: op.obj, visible: true}); delete live[op.by]; if (op.by === me) pending = pending.filter(p => p.id !== op.obj.id); }
   else if (op.op === "MOVE") op.ids.forEach(i => { const r = objs.get(i); if (r) r.obj = moved(r.obj, op.dx, op.dy);
-    if (nudge[i] && nudge[i].mid === op.msg_id) delete nudge[i];            // my own move arrived: drop the preview
+    if (nudge[i] && nudge[i].mid === op.msg_id) delete nudge[i];
     if (drag && drag.ids.includes(i) && op.by !== me) drag = null; });
   else op.ids.forEach(i => { const r = objs.get(i); if (r) r.visible = op.visible; erased.delete(i); if (!op.visible) sel.delete(i); });
   dirty = true;
 }
-let pending = [];                                         // my own objects not yet confirmed (drawn at once)
+let pending = [];                                         // my objects not confirmed yet
 
-// ---------------------------------------------------------------- drawing
+// Drawing
 function pastel(c) { return "#" + [1, 3, 5].map(i => { const v = parseInt(c.substr(i, 2), 16); return Math.round(v + (255 - v) * .7).toString(16).padStart(2, "0"); }).join(""); }
 function wrapText(t, maxw) { const out = []; let line = ""; t.split(/\s+/).forEach(w => { const s = line ? line + " " + w : w; if (g.measureText(s).width > maxw && line) { out.push(line); line = w; } else line = s; }); if (line) out.push(line); return out; }
 function shape(o) {
@@ -219,7 +217,7 @@ function frame() {
   for (const u in lasers) { lasers[u] = lasers[u].filter(q => t - q.t < 900); if (lasers[u].length) anim = true; else delete lasers[u]; }
   if (!dirty && !anim) return; dirty = false;
   g.clearRect(0, 0, W, H);
-  const off = id => drag && drag.ids.includes(id) ? drag : nudge[id];       // preview offset of an object, if any
+  const off = id => drag && drag.ids.includes(id) ? drag : nudge[id];
   objs.forEach((r, id) => { if (!r.visible) return; const n = off(id); shape(n ? moved(r.obj, n.dx, n.dy) : r.obj); });
   if (sel.size || band) { g.save(); g.strokeStyle = "#1e88e5"; g.lineWidth = 1; g.setLineDash([4, 3]);
     sel.forEach(id => { const r = objs.get(id); if (!r || !r.visible) return; const b = box(r.obj), n = off(id) || {dx: 0, dy: 0};
@@ -233,7 +231,7 @@ function frame() {
   for (const u in cursors) { const c = cursors[u], usr = users.find(x => x.name === u); if (!usr || !usr.online) continue;
     g.fillStyle = usr.color; g.beginPath(); g.arc(c.x, c.y, 4, 0, 7); g.fill(); g.font = "12px Arial"; g.textBaseline = "middle"; g.fillText(u, c.x + 8, c.y + 2); }
 }
-// Ramer-Douglas-Peucker: fewer points per stroke = fewer bytes on the wire
+// Ramer-Douglas-Peucker stroke simplification
 function rdp(p, eps) {
   if (p.length < 3) return p;
   const keep = new Uint8Array(p.length); keep[0] = keep[p.length - 1] = 1; const st = [[0, p.length - 1]];
@@ -243,7 +241,7 @@ function rdp(p, eps) {
   return p.filter((_, i) => keep[i]);
 }
 
-// ---------------------------------------------------------------- input
+// Input
 function pos(e) { const r = cv.getBoundingClientRect(); return [Math.round((e.clientX - r.left) * W / r.width), Math.round((e.clientY - r.top) * H / r.height)]; }
 function add(o) { o.id = uid(); pending.push(o); rel({type: "ADD", obj: o}); dirty = true; }
 function hit(o, x, y, r) {
@@ -258,7 +256,7 @@ function hit(o, x, y, r) {
   return x >= x0 - r && x <= x1 + r && y >= y0 - r && y <= y1 + r;
 }
 function moved(o, dx, dy) { return Object.assign({}, o, {points: o.points.map(p => [p[0] + dx, p[1] + dy])}); }
-function box(o) {                                         // bounding box [x0, y0, x1, y1] for the selection frame
+function box(o) {                                         // [x0, y0, x1, y1]
   const p = o.points, k = o.kind;
   if (k === "sticky") return [p[0][0], p[0][1], p[0][0] + 160, p[0][1] + 120];
   if (k === "image") return [p[0][0], p[0][1], p[0][0] + o.w, p[0][1] + o.h];
@@ -266,11 +264,11 @@ function box(o) {                                         // bounding box [x0, y
   const xs = p.map(q => q[0]), ys = p.map(q => q[1]), r = o.width / 2;
   return [Math.min(...xs) - r, Math.min(...ys) - r, Math.max(...xs) + r, Math.max(...ys) + r];
 }
-function objectsIn(x0, y0, x1, y1) {                      // ids of the visible objects whose box touches the rectangle
+function objectsIn(x0, y0, x1, y1) {                      // visible objects touching the rectangle
   const ids = []; objs.forEach((r, id) => { if (!r.visible || r.obj.kind === "enc") return; const b = box(r.obj);
     if (b[0] <= Math.max(x0, x1) && b[2] >= Math.min(x0, x1) && b[1] <= Math.max(y0, y1) && b[3] >= Math.min(y0, y1)) ids.push(id); }); return ids; }
 function selectAll() { if (role !== "editor") return; setTool("select"); sel = new Set(objectsIn(-1e6, -1e6, 1e6, 1e6)); dirty = true; }
-function objectAt(x, y) { let found = null; objs.forEach((r, id) => { if (r.visible && hit(r.obj, x, y, 4)) found = id; }); return found; }   // topmost = last drawn
+function objectAt(x, y) { let found = null; objs.forEach((r, id) => { if (r.visible && hit(r.obj, x, y, 4)) found = id; }); return found; }
 function eraseAt(x, y) {
   const ids = []; objs.forEach((r, id) => { if (r.visible && !erased.has(id) && hit(r.obj, x, y, 5 + width)) ids.push(id); });
   if (ids.length) { ids.forEach(i => erased.add(i)); rel({type: "ERASE", ids: ids}); }
@@ -283,7 +281,7 @@ cv.addEventListener("pointerdown", e => {
   if (tool === "text" || tool === "sticky") { cv._down = false; const s = prompt(tool === "text" ? "Enter text:" : "Note text:"); if (s) add({kind: tool, color: color, width: width, points: [[x, y]], text: s.slice(0, tool === "text" ? 500 : 300)}); }
   else if (tool === "eraser") eraseAt(x, y);
   else if (tool === "select") { cur = null; drag = band = null; const id = objectAt(x, y);
-    // object: select it (Shift adds / removes) and drag the whole selection; empty board: selection rectangle
+    // on an object: select it (Shift toggles) and drag the selection; on empty board: rectangle select
     if (!id) { if (!e.shiftKey) sel.clear(); band = {x0: x, y0: y, x1: x, y1: y}; }
     else { if (e.shiftKey) { sel.has(id) ? sel.delete(id) : sel.add(id); } else if (!sel.has(id)) sel = new Set([id]);
       if (sel.has(id)) drag = {ids: Array.from(objs.keys()).filter(i => sel.has(i) && objs.get(i).visible), x0: x, y0: y, dx: 0, dy: 0}; } }
@@ -308,14 +306,14 @@ function up() { cv._down = false;
   if (band) { const b = band; band = null; dirty = true;
     if (Math.abs(b.x1 - b.x0) > 2 || Math.abs(b.y1 - b.y0) > 2) objectsIn(b.x0, b.y0, b.x1, b.y1).forEach(i => sel.add(i)); return; }
   if (drag) { const d = drag; drag = null; dirty = true;
-    if (d.dx || d.dy) for (let k = 0; k < d.ids.length; k += 500) {          // the server takes at most 500 ids per MOVE
+    if (d.dx || d.dy) for (let k = 0; k < d.ids.length; k += 500) {          // server limit: 500 ids per MOVE
       const ids = d.ids.slice(k, k + 500), m = {type: "MOVE", ids: ids, dx: d.dx, dy: d.dy}; rel(m);
       ids.forEach(i => { nudge[i] = {dx: d.dx, dy: d.dy, mid: m.msg_id}; }); } return; }
   if (!cur) return; const o = cur; cur = null; if (o.kind === "stroke") o.points = rdp(o.points, 1.0); add(o); }
 cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
 function laser(x, y) { (lasers[me] = lasers[me] || []).push({x: x, y: y, t: now()}); raw({type: "LASER", x: x, y: y}); dirty = true; }
 
-// ---------------------------------------------------------------- toolbar
+// Toolbar
 const bar = $("bar"), tools = ["select", "pen", "eraser", "line", "rect", "oval", "text", "sticky", "laser"];
 function setTool(t) { if (t !== tool) { sel.clear(); drag = band = null; } tool = t; dirty = true;
   bar.querySelectorAll("button[data-t]").forEach(x => x.className = x.dataset.t === t ? "on" : ""); }
@@ -331,7 +329,7 @@ const wid = document.createElement("input"); wid.type = "range"; wid.min = 1; wi
   .forEach(([t, f]) => { const b = document.createElement("button"); b.textContent = t; b.onclick = f; bar.appendChild(b); });
 $("cf").onsubmit = e => { e.preventDefault(); const t = $("ci").value.trim(); if (t) { rel({type: "CHAT", text: t}); $("ci").value = ""; } };
 
-// ---------------------------------------------------------------- start
+// Start
 if (Q.get("invite")) { $("manual").style.display = "none"; $("sub").textContent = "You were invited to room " + (Q.get("room") || "") + ". Pick a name and join."; }
 if (Q.get("room")) { $("room").value = Q.get("room"); try { token = sessionStorage.getItem("wb_token_" + Q.get("room")) || ""; } catch (e) {} }
 fetch("/info").then(r => r.json()).then(i => { authOn = i.auth; }).catch(() => {});

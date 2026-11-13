@@ -1,20 +1,9 @@
-"""Peer-to-peer file transfer: the file goes straight from one client to the other.
+"""Peer-to-peer file transfer.
 
-The whiteboard server only INTRODUCES the two clients (it relays a small FILE_OFFER message with the
-sender's address, port and a one-time token); the file's bytes never pass through it. This is the
-classic split between a signalling channel (client-server) and a data channel (peer-to-peer), as in
-FTP's data connection or WebRTC.
-
-Data connection (plain TCP, sender listens, receiver connects):
-    receiver -> sender   one JSON line  {"token": "...", "offset": N}
-    sender -> receiver   one JSON line  {"ok": true, "size": S}      (or {"ok": false, "error": "..."})
-    sender -> receiver   the file's bytes from offset N to the end, then the connection closes
-
-Resume: the receiver writes to "<name>.<first 8 hex of sha256>.part". If that file already exists
-(an earlier transfer broke), it asks for the rest by sending its size as `offset`.
-Integrity: the offer carries the SHA-256 of the whole file; the receiver hashes what it has on disk
-at the end and only then renames the .part file. A wrong token closes the connection.
-Limit: the data connection is not encrypted (the offer travels inside TLS, the file does not).
+The server only relays the offer (address, port, one-time token); the file itself goes
+straight from sender to receiver over TCP. Interrupted downloads resume from the .part
+file, and the SHA-256 in the offer is checked before the file is renamed into place.
+The data connection itself is not encrypted.
 """
 import hashlib
 import json
@@ -27,7 +16,7 @@ import time
 from protocol import listen_socket
 
 CHUNK = 64 * 1024
-OFFER_TTL = 300           # the sender stops listening this long after its last activity
+OFFER_TTL = 300  # seconds of inactivity before the sender gives up
 
 
 def sha256_file(path, upto=None):
@@ -59,7 +48,7 @@ def _line(sock, limit=4096):
 
 
 class Sender:
-    """Listens on a free port and serves one file to whoever presents the token."""
+    """Serve one file on a free port to whoever presents the right token."""
     def __init__(self, path, token, on_event=None):
         self.path, self.token, self.on_event = path, token, on_event or (lambda *a: None)
         self.size = os.path.getsize(path)
@@ -118,9 +107,9 @@ class Sender:
 
 
 def fetch(host, port, token, name, size, sha, folder, on_progress=None, stop_after=None):
-    """Download (or finish downloading) a file from a Sender. Returns the final path.
-    Raises OSError / ValueError on failure; the .part file is kept so a retry resumes.
-    `stop_after` (bytes) cuts the transfer short - used by the tests to simulate a broken link."""
+    """Download a file from a Sender, resuming a previous .part file if there is one.
+    Returns the final path. On failure the .part file is kept for the next try.
+    """
     os.makedirs(folder, exist_ok=True)
     name = safe_name(name)
     part = os.path.join(folder, f"{name}.{sha[:8]}.part")
