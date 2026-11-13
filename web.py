@@ -1,23 +1,8 @@
-"""Hand-written HTTP/1.1 + WebSocket (RFC 6455) server, standard library only.
+"""Minimal HTTP + WebSocket server (RFC 6455) for browser and phone clients.
 
-Why: a browser cannot open a raw TCP socket, so phones and tablets cannot speak our length-prefixed
-protocol. The only socket a web page gets is a WebSocket. So the whiteboard server also listens on a
-second port and speaks two more protocols there:
-
-  1. HTTP    GET /            -> the web client (one HTML page, see webpage.py)
-  2. HTTP    GET /ws + "Upgrade: websocket" -> the opening handshake:
-                 Sec-WebSocket-Accept = base64( SHA-1( Sec-WebSocket-Key + fixed GUID ) )
-             The server answers "101 Switching Protocols" and from then on the SAME TCP connection
-             carries WebSocket frames instead of HTTP.
-  3. WebSocket frames. Each frame:
-                 byte 0   FIN bit + opcode (1 text, 2 binary, 8 close, 9 ping, 10 pong, 0 continuation)
-                 byte 1   MASK bit + 7-bit length (126 -> 16-bit length follows, 127 -> 64-bit length follows)
-                 4-byte masking key (client -> server frames only), then the payload XOR-ed with that key
-             Masking is mandatory for browsers (it stops a web page from making a proxy see fake HTTP).
-
-Inside every WebSocket text frame is exactly the same JSON message the desktop client sends, so the
-room logic does not know or care which kind of client it is talking to. WebSocket frames already carry
-their own length, so the 4-byte length prefix is not used on this path.
+Browsers can't open raw TCP sockets, so the server also serves the web page here and
+upgrades /ws to a WebSocket. Each text frame carries the same JSON message the desktop
+client sends, so the room code doesn't care which kind of client it is talking to.
 """
 import base64
 import hashlib
@@ -28,9 +13,9 @@ import threading
 
 from protocol import listen_socket, norm_addr
 
-WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"      # fixed by RFC 6455
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # from the RFC
 MAX_HEADER = 16 * 1024
-MAX_WS_MSG = 4 * 1024 * 1024                          # largest message we accept from a browser
+MAX_WS_MSG = 4 * 1024 * 1024
 
 
 def ws_accept(key: str) -> str:
@@ -38,7 +23,7 @@ def ws_accept(key: str) -> str:
 
 
 def ws_encode(payload: bytes, opcode: int = 1) -> bytes:
-    """One unfragmented, unmasked frame (server -> client frames are never masked)."""
+    """Build one unmasked frame (server frames are never masked)."""
     n = len(payload)
     if n < 126:
         head = struct.pack(">BB", 0x80 | opcode, n)
@@ -50,7 +35,7 @@ def ws_encode(payload: bytes, opcode: int = 1) -> bytes:
 
 
 def _xor(data: bytes, key: bytes) -> bytes:
-    """XOR with the repeating 4-byte key, done as one big-integer operation (fast even for megabytes)."""
+    """Unmask a payload with the 4-byte key."""
     n = len(data)
     if not n:
         return b""
@@ -69,9 +54,9 @@ def _exact(sock, n):
 
 
 def ws_recv(sock, send):
-    """Read one complete message; returns (payload bytes, bytes on the wire). Answers ping frames,
-    joins fragmented messages and raises ConnectionError when the browser closes the connection.
-    `send(frame)` queues a frame for this connection."""
+    """Read one complete message. Returns (payload, bytes_on_wire).
+    Answers pings, joins fragments and raises ConnectionError when the browser closes.
+    """
     parts, wire = [], 0
     while True:
         b0, b1 = _exact(sock, 2)
@@ -88,15 +73,15 @@ def ws_recv(sock, send):
         key = _exact(sock, 4)
         data = _xor(_exact(sock, n), key)
         wire += 4 + n
-        if opcode == 8:                                  # close: echo it and stop
+        if opcode == 8:  # close
             send(ws_encode(data[:2], 8))
             raise ConnectionError("websocket closed")
-        if opcode == 9:                                  # ping -> pong with the same payload
+        if opcode == 9:  # ping
             send(ws_encode(data, 10))
             continue
         if opcode == 10:
             continue
-        parts.append(data)                               # text / binary / continuation
+        parts.append(data)
         if fin:
             return b"".join(parts), wire
 
@@ -108,7 +93,7 @@ def _http(sock, status, body=b"", ctype="text/plain; charset=utf-8", extra=""):
 
 
 def read_request(sock):
-    """Read the request line and headers. Returns (method, path, headers dict with lower-case names)."""
+    """Read the request line and headers. Returns (method, path, headers)."""
     buf = bytearray()
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
@@ -128,7 +113,7 @@ def read_request(sock):
 
 
 def serve_connection(sock, addr, page, info, on_websocket, timeout, extra=None):
-    """One browser connection: either a plain HTTP request (answer and close) or a WebSocket upgrade."""
+    """Handle one browser connection: a plain HTTP request or a WebSocket upgrade."""
     try:
         sock.settimeout(timeout)
         method, path, h = read_request(sock)
@@ -139,13 +124,13 @@ def serve_connection(sock, addr, page, info, on_websocket, timeout, extra=None):
                 return _http(sock, "400 Bad Request", b"WebSocket upgrade expected")
             sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                           f"Sec-WebSocket-Accept: {ws_accept(key)}\r\n\r\n").encode("ascii"))
-            on_websocket(sock, addr)                     # returns when the connection ends
+            on_websocket(sock, addr)
             return
         if method != "GET":
             return _http(sock, "405 Method Not Allowed", b"GET only", extra="Allow: GET\r\n")
         if route in ("/", "/index.html"):
             return _http(sock, "200 OK", page(), "text/html; charset=utf-8")
-        if extra is not None:                            # more pages (e.g. the admin dashboard)
+        if extra is not None:  # e.g. the admin dashboard
             query = dict(kv.split("=", 1) for kv in path.partition("?")[2].split("&") if "=" in kv)
             res = extra(route, query)
             if res is not None:
@@ -163,7 +148,7 @@ def serve_connection(sock, addr, page, info, on_websocket, timeout, extra=None):
 
 
 def start(host, port, page, info, on_websocket, timeout=15, extra=None):
-    """Listen on `port` (IPv4 and IPv6) and serve every connection in its own thread."""
+    """Listen on `port` and handle each connection in its own thread."""
     srv, _v6 = listen_socket(host, port)
     srv.listen(50)
 

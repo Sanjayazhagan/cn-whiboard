@@ -1,20 +1,10 @@
-"""Connection diagnostics: "why can't I connect?" answered layer by layer.
+"""Connection checker: works out why a client can't reach the server.
 
-Run from the client's login screen (button "Diagnose connection") or on its own:
     python diagnose.py SERVER-IP [PORT] [--no-tls]
 
-Checks, bottom of the stack to the top:
-  1. this PC's addresses (is it on a network at all, and on the same subnet as the server?)
-  2. name / address resolution (IPv4 or IPv6)
-  3. TCP three-way handshake to the server port. The three possible outcomes mean different things:
-       connected            -> the server is reachable
-       refused (RST)        -> the PC is reachable but nothing listens there (server not started / wrong port)
-       timeout (no answer)  -> packets are dropped: wrong IP, different network, or a firewall
-  4. TLS handshake (version, cipher, certificate fingerprint) - or a hint that TLS is on one side only
-  5. application layer: PING -> PONG round-trip time over that connection
-  6. the browser port (HTTP GET /info) and the voice port (UDP)
-  7. UDP LAN discovery broadcast: does the server answer?
-  8. the route: the system's traceroute / tracert (each router on the way; on one LAN this is a single hop)
+Also available from the login screen ("Diagnose connection"). Checks, in order: local
+addresses, name resolution, TCP connect, TLS, PING/PONG, the web and voice ports,
+LAN discovery and the route.
 """
 import json
 import shutil
@@ -50,7 +40,7 @@ def local_addresses():
 
 
 def tcp_probe(host, port, timeout=3):
-    """Returns (socket or None, verdict, text). Distinguishes refused from timed out."""
+    """Return (socket or None, verdict, text). Tells 'refused' apart from 'timed out'."""
     t0 = time.time()
     try:
         s = socket.create_connection((host, port), timeout=timeout)
@@ -71,7 +61,7 @@ def traceroute(host, emit, hops=8):
     if not tool:
         return emit(INFO, "route", "no traceroute tool on this PC (Linux: sudo apt install traceroute)")
     if win:
-        cmd, kw = [tool, "-d", "-h", str(hops), "-w", "700", host], {"creationflags": 0x08000000}   # no console window
+        cmd, kw = [tool, "-d", "-h", str(hops), "-w", "700", host], {"creationflags": 0x08000000}
     elif tool.endswith("tracepath"):
         cmd, kw = [tool, "-n", "-m", str(hops), host], {}
     else:
@@ -89,8 +79,7 @@ def traceroute(host, emit, hops=8):
 
 def run(host, port=DEFAULT_PORT, tls=True, emit=print, web_port=WEB_PORT, discovery_port=DISCOVERY_PORT,
         route=True):
-    """Run every check, reporting each line through emit(verdict, check_name, text). Returns the number
-    of failed checks."""
+    """Run every check, reporting each result through emit(verdict, name, text). Returns the number of failures."""
     bad = 0
 
     def out(verdict, name, text):
@@ -136,8 +125,8 @@ def run(host, port=DEFAULT_PORT, tls=True, emit=print, web_port=WEB_PORT, discov
                 try:
                     reply = recv_msg(s)
                     st = reply.get("stats", {})
-                    if isinstance(reply.get("web"), int):       # the server says which web port it really uses
-                        web_port = reply["web"]                 # (it moves on when 8080 is taken by another program)
+                    if isinstance(reply.get("web"), int):  # the server tells us its real web port
+                        web_port = reply["web"]
                     out(OK, "protocol", f"PING -> {reply.get('type')} in {(time.time() - t0) * 1000:.0f} ms; server up "
                                         f"{st.get('uptime', '?')} s, {st.get('conns', '?')} connections so far")
                 except (OSError, ValueError):

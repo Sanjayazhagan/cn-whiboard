@@ -1,17 +1,8 @@
-"""Accounts, password hashing, JWT and TLS certificates (standard library, plus optional `cryptography`).
+"""Accounts, password hashing, JWTs and the server's TLS certificate.
 
-Passwords: never stored. We store PBKDF2-HMAC-SHA256(password, random 16-byte salt, 200 000 rounds).
-  The salt makes equal passwords hash differently (no precomputed tables); the many rounds make
-  each guess slow for someone who steals the database. Checking uses a constant-time compare.
-
-JWT (JSON Web Token, RFC 7519), HS256: header.payload.signature, each part base64url without padding.
-  signature = HMAC-SHA256(server secret, "header.payload"). The server can check a token without a
-  database lookup and nobody without the secret can forge or edit one. A JWT is SIGNED, not
-  encrypted: anyone who sees it can read the payload, which is why the connection uses TLS.
-
-TLS: the server needs a certificate. On first start it creates a self-signed one (server_cert.pem /
-  server_key.pem). Clients cannot check a self-signed certificate against a CA, so they use
-  "trust on first use" like SSH: remember the certificate's SHA-256 fingerprint and warn if it changes.
+Passwords are stored as PBKDF2-HMAC-SHA256 with a random salt, never in plain text.
+Tokens are HS256 JWTs signed with a server secret. The certificate is self-signed, so
+clients pin its fingerprint the first time they connect (like SSH).
 """
 import base64
 import hashlib
@@ -25,12 +16,12 @@ import subprocess
 import time
 
 PBKDF2_ROUNDS = 200_000
-JWT_TTL = 24 * 3600                 # tokens are valid for 24 hours
+JWT_TTL = 24 * 3600  # 24 hours
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,20}$")
 MIN_PASSWORD = 4
 
 
-# ---------------------------------------------------------------- passwords
+# Passwords
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
@@ -43,12 +34,12 @@ def verify_password(password: str, stored: str) -> bool:
         if algo != "pbkdf2_sha256":
             return False
         dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), _unb64(salt), int(rounds))
-        return hmac.compare_digest(dk, _unb64(want))        # constant time: no timing side channel
+        return hmac.compare_digest(dk, _unb64(want))
     except (ValueError, TypeError):
         return False
 
 
-# ---------------------------------------------------------------- JWT (HS256)
+# JWT
 def _b64(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
 
@@ -69,7 +60,7 @@ class TokenError(Exception):
 
 
 def jwt_decode(token: str, secret: bytes) -> dict:
-    """Return the claims of a valid, unexpired token; raise TokenError otherwise."""
+    """Return the claims of a valid token, or raise TokenError."""
     try:
         header, payload, sig = token.split(".")
         h = json.loads(_unb64(header))
@@ -77,7 +68,7 @@ def jwt_decode(token: str, secret: bytes) -> dict:
         given = _unb64(sig)
     except (ValueError, AttributeError, TypeError):
         raise TokenError("malformed token")
-    if h.get("alg") != "HS256":           # never accept "none" or another algorithm chosen by the client
+    if h.get("alg") != "HS256":  # reject "none" and any other algorithm
         raise TokenError("unsupported algorithm")
     want = hmac.new(secret, f"{header}.{payload}".encode(), hashlib.sha256).digest()
     if not hmac.compare_digest(want, given):
@@ -93,9 +84,9 @@ def issue_token(user: str, secret: bytes) -> tuple:
     return jwt_encode(claims, secret), claims["exp"]
 
 
-# ---------------------------------------------------------------- login rate limiting
+# Login rate limiting
 class RateLimiter:
-    """At most `limit` failed logins per IP address per `window` seconds (slows down password guessing)."""
+    """Allow at most `limit` failed logins per IP in `window` seconds."""
     def __init__(self, limit=5, window=60):
         self.limit, self.window, self.fails = limit, window, {}
 
@@ -111,18 +102,19 @@ class RateLimiter:
         self.fails.pop(ip, None)
 
 
-# ---------------------------------------------------------------- TLS certificate
+# TLS certificate
 def fingerprint(der: bytes) -> str:
     h = hashlib.sha256(der).hexdigest().upper()
     return ":".join(h[i:i + 2] for i in range(0, len(h), 2))
 
 
 def ensure_certificate(cert_path, key_path, name="lan-whiteboard"):
-    """Create a self-signed certificate if none exists. Returns a message describing what happened,
-    or raises RuntimeError if no tool is available (then the server runs without TLS)."""
+    """Create a self-signed certificate if there isn't one yet.
+    Raises RuntimeError if neither `cryptography` nor openssl is available.
+    """
     if os.path.exists(cert_path) and os.path.exists(key_path):
         return f"using certificate {cert_path}"
-    try:                                       # 1st choice: the `cryptography` package (pip install cryptography)
+    try:
         import datetime
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
@@ -144,7 +136,7 @@ def ensure_certificate(cert_path, key_path, name="lan-whiteboard"):
         return f"created self-signed certificate {cert_path}"
     except ImportError:
         pass
-    if shutil.which("openssl"):                # 2nd choice: the openssl command line tool
+    if shutil.which("openssl"):  # fall back to the openssl command
         subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
                         "-nodes", "-days", "3650", "-subj", f"/CN={name}", "-keyout", key_path, "-out", cert_path],
                        check=True, capture_output=True)

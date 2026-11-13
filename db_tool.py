@@ -1,9 +1,9 @@
-"""Look inside the server's database (safe to run while the server is running).
+"""Inspect the server's database. Safe to run while the server is up.
 
-  python db_tool.py                    list rooms with counts
-  python db_tool.py ROOMCODE           details of one room: members, op log summary, chat, versions
-  python db_tool.py --sql "SELECT ..." run any SQL query (e.g. for screenshots in the report)
-  add --db path/to/whiteboard.db if the file is somewhere else
+  python db_tool.py                     list rooms
+  python db_tool.py ROOMCODE            members, ops, chat and versions of one room
+  python db_tool.py --sql "SELECT ..."  run a query
+  --db PATH                             use another database file
 """
 import argparse
 import sqlite3

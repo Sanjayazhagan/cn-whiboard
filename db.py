@@ -1,24 +1,10 @@
-"""SQLite persistence for the whiteboard server (Python standard library only).
+"""SQLite storage for the server.
 
-Design: the in-memory Room objects stay the authority while the server runs (fast, and the
-room lock already gives one total order). Every state change is ALSO written to SQLite, so after a
-restart (or a crash) the server rebuilds every room by replaying its op log. Clients that were
-connected simply auto-reconnect with their saved token and get their room back.
+Rooms live in memory while the server runs; every change is also written here so the
+server can rebuild all rooms after a restart by replaying the op log. Writes go through
+a queue and a single writer thread, so they never block a room.
 
-Writes never block the room: they go into a queue and one writer thread executes them in
-batches inside a single transaction (one disk sync per batch instead of one per op). The queue
-keeps the same order as the room lock produced, so the op log on disk has the same seq order.
-
-Tables
-  rooms(code, password, host, created)
-  members(room, name, token, color, role)        - identity used for reconnection
-  banned(room, name)                             - users kicked by the host
-  room_cfg(room, cfg)                            - room switches set by the host (JSON: voice, e2e)
-  ops(room, seq, ts, by, kind, body)             - the sequenced op log (body = op as JSON)
-  chat(room, id, ts, user, text, msg_id)
-  versions(room, id, label, ts, seq, visible)    - version history (visible = JSON list of ids)
-  users(name, pw_hash, created)                  - accounts; pw_hash is PBKDF2 (see auth.py), never the password
-  meta(key, value)                               - e.g. the JWT signing secret (so tokens survive restarts)
+Tables: rooms, members, banned, room_cfg, ops, chat, versions, users, meta.
 """
 import json
 import queue
@@ -47,7 +33,7 @@ CREATE TABLE IF NOT EXISTS meta    (key TEXT PRIMARY KEY, value TEXT);
 class Store:
     def __init__(self, path, on_write=None):
         self.path = path
-        self.on_write = on_write              # callback(n) for statistics
+        self.on_write = on_write
         self.q = queue.Queue()
         con = sqlite3.connect(path)
         con.executescript(SCHEMA)
@@ -55,7 +41,7 @@ class Store:
         self.writer = threading.Thread(target=self._writer, daemon=True)
         self.writer.start()
 
-    # ---------------------------------------------------------------- writing (non-blocking)
+    # Writing
     def _put(self, sql, args=()):
         self.q.put((sql, args))
 
@@ -90,7 +76,7 @@ class Store:
             con.close()
 
     def secret(self, make):
-        """The JWT signing secret: read it, or create it once with make() and store it."""
+        """Load the JWT signing secret, creating it on first use."""
         con = sqlite3.connect(self.path)
         try:
             row = con.execute("SELECT value FROM meta WHERE key='jwt_secret'").fetchone()
@@ -104,7 +90,7 @@ class Store:
             con.close()
 
     def wipe(self):
-        """Standby server: forget everything before taking a fresh copy from the primary."""
+        """Wipe everything (a standby does this before copying the primary)."""
         for t in ("rooms", "members", "banned", "room_cfg", "ops", "chat", "versions", "users"):
             self._put(f"DELETE FROM {t}")
 
@@ -123,25 +109,25 @@ class Store:
         self._put("DELETE FROM versions WHERE room=? AND id=?", (code, vid))
 
     def flush(self, timeout=10):
-        """Wait until everything queued so far is on disk (used at shutdown and in tests)."""
+        """Block until everything queued so far has been written."""
         done = threading.Event()
         self.q.put(done)
         return done.wait(timeout)
 
     def _writer(self):
         con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")     # readers (db_tool.py) never block the server
+        con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=NORMAL")
         while True:
             batch = [self.q.get()]
-            while len(batch) < 500:                 # group whatever else is already waiting
+            while len(batch) < 500:
                 try:
                     batch.append(self.q.get_nowait())
                 except queue.Empty:
                     break
             events, n = [], 0
             try:
-                with con:                           # one transaction per batch
+                with con:
                     for item in batch:
                         if isinstance(item, threading.Event):
                             events.append(item)
@@ -155,9 +141,9 @@ class Store:
             for e in events:
                 e.set()
 
-    # ---------------------------------------------------------------- loading (at startup only)
+    # Loading
     def load(self):
-        """Return plain data for every saved room; the server rebuilds Room objects from it."""
+        """Return every saved room as plain data."""
         con = sqlite3.connect(self.path)
         out = []
         for code, password, host, created in con.execute("SELECT * FROM rooms ORDER BY created"):

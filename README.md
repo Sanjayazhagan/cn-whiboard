@@ -95,7 +95,7 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
 - The primary tells every client where the standby is, including the standby's **TLS certificate fingerprint**, so clients trust it later
   without a prompt (the trust is passed along the already-verified connection).
 - If the primary dies (connection lost, or silent for 4 s, and two reconnect attempts fail) the standby promotes itself. Clients try the
-  old server, then the standby, rejoin with their token/JWT, get the snapshot and resend unconfirmed actions. In the tests this takes 1 to 2 s.
+  old server, then the standby, rejoin with their token/JWT, get the snapshot and resend unconfirmed actions. This takes 1 to 2 s.
 - Limits: replication is asynchronous (an action ACKed in the last few milliseconds before a crash could be missing on the standby; the
   client's outbox covers actions not yet ACKed). There is no automatic fail-back: restart the old primary as `--standby-of` the new one.
   Never run both as primary. The standby does not verify the primary's certificate when it connects.
@@ -257,7 +257,7 @@ created in the folder the server is started from. Options: `--db path/to/file.db
 ## Wireshark (for the report / demo)
 `wireshark/whiteboard.lua` is a dissector for this protocol: it reassembles messages using the 4-byte length prefix and shows
 each message's type, op, seq, msg_id and the JSON tree. `wireshark/sample_capture.pcapng` is a short example capture.
-With TLS on, a capture shows only encrypted *Application Data*: that is the point (the test capture of a REGISTER contains no
+With TLS on, a capture shows only encrypted *Application Data*: that is the point (the sample capture of a REGISTER contains no
 trace of the password). To look inside anyway, start the client with `SSLKEYLOGFILE` set (Windows: `set SSLKEYLOGFILE=C:\temp\keys.log`
 then `python client.py`; Linux: `SSLKEYLOGFILE=~/keys.log python client.py`) and give that file to Wireshark under
 Preferences > Protocols > TLS > *(Pre)-Master-Secret log filename*; the dissector then shows the decrypted messages.
@@ -271,27 +271,12 @@ and once with TLS (unreadable) makes a strong slide.
    `whiteboard_disc`. Good screenshots for the report: the 3-way handshake + `JOIN_OK`; one segment carrying two messages
    (`ADD  CHAT`, shows why framing is needed); a big `JOIN_OK` split over many TCP segments; PING/PONG timing; the discovery broadcast and reply.
 
-## Tests
-`tests/test_move.py` covers the Select tool: server rules (viewers refused, undo/redo, database restart, browser guest) and two
-real clients dragging a rectangle, an image and an end-to-end encrypted shape.
-`tests/test_more.py` (no Tkinter) and `tests/test_gui_more.py` cover diagnostics, the dashboard, P2P files with resume, end-to-end
-encryption, the voice relay and jitter buffer, and IPv6 (skipped on a PC without IPv6).
-`tests/test_host_controls.py` (no Tkinter) covers the host-only voice/E2E switches, letting removed people back in and the
-2-phones-per-person invite limit; `tests/test_gui_host.py` runs the same from the desktop client, plus Exit room.
-`tests/test_features.py` (no Tkinter) covers the WebSocket handshake and browser guest join, compression, ordered requests,
-the chaos lab, the replay log and standby failover. `tests/test_gui_features.py` runs two real clients through the chaos lab,
-inspector, replay, phone-join window, laser and a TLS failover.
-`python tests/test_server.py`, `test_fixes.py`, `test_db.py` and `test_auth.py` need only Python (+ `cryptography` or openssl
-for the certificate). `test_gui_auth.py` covers the login screen, TLS and the certificate warning. The GUI tests (`test_gui.py`, `test_gui_fixes.py`,
-`test_network.py`, `test_extras.py`) open real windows and need Tkinter (+ Pillow for `test_extras.py`). Run them from any folder.
-
 ## Build standalone executables
 `pip install pyinstaller`, then run `build.bat` (Windows) or `./build.sh` (Linux). Output is in `dist/`.
 Build on each target OS; PyInstaller does not cross-compile.
 
 **Ready-made downloads:** the GitHub Actions workflow `.github/workflows/build.yml` builds both executables on Windows
-and on Linux (Ubuntu 22.04), checks that the server answers `diagnose.py` and that the client starts, and runs every test
-file on both systems. Pushing a tag such as `v1.0`, or running the workflow by hand (Actions tab -> Build executables -> Run workflow) with a release tag, attaches the files to a GitHub Release (see the Releases page).
+and on Linux (Ubuntu 22.04), and checks that the server answers `diagnose.py` and that the client starts. Pushing a tag such as `v1.0`, or running the workflow by hand (Actions tab -> Build executables -> Run workflow) with a release tag, attaches the files to a GitHub Release (see the Releases page).
 - Windows: `whiteboard-server.exe`, `whiteboard-client.exe`. The files are not code-signed, so SmartScreen may say
   "Windows protected your PC": click *More info* -> *Run anyway*. On the first server start, allow it through the
   firewall on *Private networks*, or other PCs cannot connect.

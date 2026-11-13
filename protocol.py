@@ -1,11 +1,7 @@
-"""Shared wire protocol: 4-byte big-endian length prefix + UTF-8 JSON body.
+"""Wire format shared by the client and server.
 
-TCP is a byte stream with no message boundaries, so every message is framed with
-its length. Every message is a JSON object with at least a "type" field.
-
-LAN discovery uses UDP instead: a client broadcasts DISCOVER_MAGIC to
-DISCOVERY_PORT and every server on the subnet answers with a small JSON datagram
-(unicast, back to the sender) saying which TCP port it listens on.
+Each TCP message is a 4-byte big-endian length followed by a UTF-8 JSON object with a
+"type" field. LAN discovery is a UDP broadcast that every server answers with its port.
 """
 import errno
 import json
@@ -13,42 +9,42 @@ import socket
 import struct
 import zlib
 
-MAX_MSG = 32 * 1024 * 1024  # refuse absurd frames (a room snapshot with images can be ~20 MB)
+MAX_MSG = 32 * 1024 * 1024  # a snapshot with images can be ~20 MB
 DEFAULT_PORT = 5050
-DISCOVERY_PORT = 5051  # UDP
-WEB_PORT = 8080        # HTTP + WebSocket (browser / phone clients)
-VOICE_PORT = 5053      # UDP voice relay
+DISCOVERY_PORT = 5051
+WEB_PORT = 8080  # browser clients
+VOICE_PORT = 5053
 DISCOVER_MAGIC = b"WB_DISCOVER_V1"
-# Compression: the top bit of the 4-byte length marks a zlib-compressed body (lengths never get near
-# 2^31, so the bit is free). A sender compresses only bodies >= Z_MIN bytes and only if that makes
-# them smaller, so small messages (CURSOR, PING, ACK) are never slowed down.
+# The top bit of the length marks a zlib-compressed body. Only bodies of Z_MIN bytes or
+# more are compressed, so small messages like CURSOR and PING are left alone.
 Z_FLAG = 0x80000000
 Z_MIN = 256
-HEARTBEAT_SEC = 1      # client sends PING this often (also used to measure round-trip latency)
-TIMEOUT_SEC = 15       # server drops a client silent for this long
+HEARTBEAT_SEC = 1  # also used to measure latency
+TIMEOUT_SEC = 15
 
 
 def compress_frame(frame: bytes) -> bytes:
-    """Compressed version of an already encoded plain frame (or the same frame if that is not smaller)."""
+    """Compress an encoded frame if that actually makes it smaller."""
     body = frame[4:]
     if len(body) < Z_MIN:
         return frame
     z = zlib.compress(body, 6)
-    if len(z) >= len(body):                 # e.g. PNG image data: already compressed
+    if len(z) >= len(body):  # already compressed (e.g. images)
         return frame
     return struct.pack(">I", len(z) | Z_FLAG) + z
 
 
 def encode_msg(obj: dict, compress: bool = False) -> bytes:
-    """One frame = 4-byte big-endian length + JSON body. Encoding is separate from sending so the
-    server can encode a broadcast once and queue the same bytes for every client."""
+    """Encode one message as a frame. Kept separate from sending so a broadcast is
+    encoded once and the same bytes are queued for every client.
+    """
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
     frame = struct.pack(">I", len(body)) + body
     return compress_frame(frame) if compress else frame
 
 
 def send_msg(sock: socket.socket, obj: dict, compress: bool = False) -> int:
-    """Send one framed message; returns the number of bytes put on the wire (for statistics)."""
+    """Send one message. Returns the number of bytes sent."""
     frame = encode_msg(obj, compress)
     sock.sendall(frame)
     return len(frame)
@@ -65,7 +61,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def recv_frame(sock: socket.socket):
-    """Receive one framed message; returns (message, bytes_on_wire, bytes_uncompressed, was_compressed)."""
+    """Receive one message. Returns (msg, bytes_on_wire, bytes_uncompressed, was_compressed)."""
     (length,) = struct.unpack(">I", _recv_exact(sock, 4))
     z = bool(length & Z_FLAG)
     length &= ~Z_FLAG
@@ -75,7 +71,7 @@ def recv_frame(sock: socket.socket):
     if z:
         d = zlib.decompressobj()
         try:
-            body = d.decompress(body, MAX_MSG + 1)      # bounded: a "zip bomb" cannot exhaust memory
+            body = d.decompress(body, MAX_MSG + 1)  # cap the size so a zip bomb can't eat all memory
         except zlib.error:
             raise ConnectionError("bad compressed frame")
         if len(body) > MAX_MSG or d.unconsumed_tail:
@@ -84,7 +80,7 @@ def recv_frame(sock: socket.socket):
 
 
 def recv_msg_ex(sock: socket.socket):
-    """Receive one framed message; returns (message, bytes_on_wire)."""
+    """Receive one message. Returns (msg, bytes_on_wire)."""
     return recv_frame(sock)[:2]
 
 
@@ -93,15 +89,15 @@ def recv_msg(sock: socket.socket) -> dict:
 
 
 def simplify(points, eps=1.0):
-    """Ramer-Douglas-Peucker: drop the points of a stroke that lie within `eps` pixels of the straight
-    line between their neighbours. A hand-drawn stroke usually keeps its shape with 20-40% of the points,
-    so the ADD message (and every snapshot that contains it) gets that much smaller."""
+    """Simplify a stroke with Ramer-Douglas-Peucker: drop points closer than `eps`
+    pixels to the line between their neighbours.
+    """
     if len(points) < 3:
         return list(points)
     keep = [False] * len(points)
     keep[0] = keep[-1] = True
     stack = [(0, len(points) - 1)]
-    while stack:                            # iterative (a long stroke would overflow the recursion limit)
+    while stack:  # iterative so long strokes don't hit the recursion limit
         a, b = stack.pop()
         (ax, ay), (bx, by) = points[a], points[b]
         dx, dy = bx - ax, by - ay
@@ -119,11 +115,9 @@ def simplify(points, eps=1.0):
 
 
 def port_taken(host, port, timeout=0.3):
-    """True if some program already accepts TCP connections on this port of this machine.
-
-    bind() alone does not tell us on Windows: there SO_REUSEADDR lets two programs listen on the same
-    port, and the connections go to the other one (seen in the lab: EDB Postgres' web server on 8080
-    answered the phones instead of the whiteboard). So we simply try to connect before we bind."""
+    """True if something already accepts connections on this port.
+    On Windows bind() can succeed on a port another program is using, so we try connecting first.
+    """
     targets = ("127.0.0.1", "::1") if host in ("0.0.0.0", "", "::") else (host,)
     for h in targets:
         try:
@@ -135,10 +129,7 @@ def port_taken(host, port, timeout=0.3):
 
 
 def _own_port(s):
-    """Socket options before bind(): this port is ours alone.
-    Linux/macOS: SO_REUSEADDR only skips the TIME_WAIT pause after a restart; a second listener still
-    gets "address already in use". Windows: SO_REUSEADDR would allow a second listener (port hijacking),
-    so SO_EXCLUSIVEADDRUSE is used instead; Windows has no TIME_WAIT pause for listening sockets."""
+    """Make the port exclusive (SO_EXCLUSIVEADDRUSE on Windows, SO_REUSEADDR elsewhere)."""
     if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
     else:
@@ -146,11 +137,10 @@ def _own_port(s):
 
 
 def listen_socket(host, port, kind=socket.SOCK_STREAM):
-    """A listening/bound socket. For the default "all addresses" host this is a dual-stack IPv6
-    socket (IPV6_V6ONLY off): one socket accepts both IPv6 clients and IPv4 clients (which then
-    appear as IPv4-mapped addresses, ::ffff:a.b.c.d). Falls back to plain IPv4 where IPv6 is missing.
-    Raises OSError (EADDRINUSE) if another program already uses the port.
-    Returns (socket, True if IPv6 is served)."""
+    """Bind a socket. For the "all addresses" host this is a dual-stack IPv6 socket that
+    also accepts IPv4 clients, falling back to IPv4 if IPv6 isn't available.
+    Returns (socket, ipv6). Raises OSError if the port is taken.
+    """
     if kind == socket.SOCK_STREAM and port and port_taken(host, port):
         raise OSError(errno.EADDRINUSE, f"port {port} is already used by another program")
     if host in ("0.0.0.0", "", "::"):
@@ -166,7 +156,7 @@ def listen_socket(host, port, kind=socket.SOCK_STREAM):
                 s.close()
             if e.errno in (errno.EADDRINUSE, errno.EACCES, getattr(errno, "WSAEADDRINUSE", -1),
                            getattr(errno, "WSAEACCES", -1)):
-                raise                        # taken: do not quietly retry on IPv4 only
+                raise  # port taken, don't silently fall back to IPv4
         except AttributeError:
             if s is not None:
                 s.close()
@@ -183,7 +173,7 @@ def listen_socket(host, port, kind=socket.SOCK_STREAM):
 
 
 def norm_addr(addr):
-    """(ip, port) with an IPv4-mapped IPv6 address written as plain IPv4."""
+    """Normalise an IPv4-mapped IPv6 address to plain IPv4."""
     ip = addr[0]
     return (ip[7:] if ip.startswith("::ffff:") and "." in ip else ip, addr[1])
 

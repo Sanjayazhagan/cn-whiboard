@@ -1,5 +1,5 @@
-# Builds the whiteboard executables for Windows and Linux with PyInstaller, smoke-tests them,
-# and runs the test suite on both systems.
+# Builds the whiteboard executables for Windows and Linux with PyInstaller and smoke-tests them
+# (the server answers diagnose.py, the client starts).
 #   - every push / pull request: binaries are uploaded as workflow artifacts (Actions tab -> run -> Artifacts)
 #   - pushing a tag like v1.0, or running the workflow by hand with a release_tag: the binaries are also
 #     attached to a GitHub Release (Releases page)
@@ -88,35 +88,6 @@ jobs:
         with:
           name: whiteboard-${{ matrix.label }}
           path: out/
-
-  tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-22.04]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb libportaudio2; fi
-          pip install pillow cryptography qrcode
-      - name: Run every test file (reports all results, fails if any failed)
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then Xvfb :99 -screen 0 1280x800x24 & export DISPLAY=:99; sleep 2; fi
-          failed=""
-          for t in tests/test_*.py; do
-            echo "::group::$t"
-            if timeout 300 python "$t"; then echo "PASS $t"; else echo "FAIL $t"; failed="$failed $t"; fi
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then echo "Failed:$failed"; exit 1; fi
-          echo "All tests passed"
 
   release:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''

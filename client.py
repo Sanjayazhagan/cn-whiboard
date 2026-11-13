@@ -1,21 +1,12 @@
 """LAN whiteboard client (Tkinter). Run: python client.py
 
-Threads: a reader thread pushes server messages into a queue; a heartbeat thread
-sends PING; the Tk main thread polls the queue (Tkinter is not thread-safe, so
-sockets never touch widgets directly). LAN discovery runs in its own short-lived
-thread and reports back through the same queue.
+A reader thread puts server messages on a queue and the Tk thread polls it, since
+Tkinter isn't thread-safe. A heartbeat thread sends PING once a second.
 
-Reliability: requests that change the board (ADD, ERASE, MOVE, UNDO, REDO, CLEAR) and chat
-carry a msg_id and stay in an "outbox" until the server ACKs them. After a reconnect
-everything still in the outbox is sent again; the server ignores ids it has already
-processed, so nothing is lost and nothing is applied twice.
-
-The same outbox is also covered by a retransmit timer (ARQ): every request has a request
-number `rn`; if the oldest one is not ACKed within the timeout (derived from the measured
-round-trip time, doubled on every retry) all unACKed requests are sent again in order. The
-server processes requests strictly in rn order and holds back any that arrive early. Together with the sequence-gap
-resync and the heartbeat check ("the server is at seq N, am I?") the board repairs itself
-when messages are lost - which the Chaos lab window lets the host do on purpose.
+Requests that change the board (and chat) carry a msg_id and stay in the outbox until
+the server ACKs them. They're resent after a reconnect, and a retransmit timer resends
+them if the oldest one isn't ACKed in time. The server drops duplicates, so nothing is
+lost or applied twice.
 """
 import base64
 import io
@@ -42,41 +33,40 @@ import voice
 from auth import fingerprint
 
 CANVAS_W, CANVAS_H = 1000, 640
-MOVE_MAX_IDS = 500        # most object ids the server accepts in one MOVE request
-DEFAULT_TLS = True        # "Encrypted connection" ticked by default (discovery sets it per server)
-# fingerprints of servers seen before (trust on first use); override with WB_KNOWN_SERVERS for tests
+MOVE_MAX_IDS = 500  # server limit per MOVE
+DEFAULT_TLS = True
+# pinned server fingerprints (WB_KNOWN_SERVERS overrides the file)
 KNOWN_SERVERS = os.environ.get("WB_KNOWN_SERVERS") or os.path.join(os.path.expanduser("~"),
                                                                     ".lan_whiteboard_known_servers.json")
 
 
 class CertRejected(OSError):
-    """The server's TLS certificate did not match the one we trusted before."""
-try:                      # Pillow is optional: needed for PNG export and JPEG/large image insertion
+    """The server's certificate doesn't match the one we trusted before."""
+try:  # optional: PNG export and JPEG/large images
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     Image = None
-try:                      # optional: draws the QR code for "Phone join" (the link is shown either way)
+try:  # optional: QR code in the Phone join window
     import qrcode
 except ImportError:
     qrcode = None
 
 
 def pastel(color):
-    """Sticky-note fill: the chosen colour blended 70% toward white."""
+    """Sticky-note colour: the chosen colour blended 70% toward white."""
     r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
     return "#%02x%02x%02x" % tuple(int(v + (255 - v) * 0.7) for v in (r, g, b))
 
 
 def discover_servers(q, wait=1.5, port=DISCOVERY_PORT):
-    """UDP broadcast discovery (runs in a worker thread). Sends one DISCOVER datagram to the
-    broadcast addresses and collects the servers' unicast replies for `wait` seconds."""
+    """Broadcast a discovery request and collect the replies for `wait` seconds."""
     found = {}
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         s.settimeout(0.2)
         targets = {"255.255.255.255", "127.0.0.1"}
-        try:   # also the /24 directed broadcast of every local address (helps PCs with several adapters)
+        try:  # also the /24 broadcast of each local address (PCs with several adapters)
             for ip in socket.gethostbyname_ex(socket.gethostname())[2] + [_local_ip()]:
                 if not ip.startswith("127."):
                     targets.add(ip.rsplit(".", 1)[0] + ".255")
@@ -98,7 +88,7 @@ def discover_servers(q, wait=1.5, port=DISCOVERY_PORT):
                 continue
             if not isinstance(info, dict) or info.get("type") != "WB_SERVER":
                 continue
-            # the reply's source address is the server's IP as seen from here
+            # the reply comes from the server's IP
             info["addr"] = info.get("ip", addr[0]) if addr[0].startswith("127.") else addr[0]
             key = info.get("id", addr[0])
             if key not in found or found[key]["addr"].startswith("127."):
@@ -120,19 +110,19 @@ def _local_ip():
 
 
 class Net:
-    """Owns the socket. A 'generation' number lets stale threads from an old connection exit."""
+    """Owns the socket. The generation number lets threads from an old connection exit."""
     def __init__(self, q):
         self.q, self.sock, self.gen = q, None, 0
         self.open, self.target = False, None
-        self.tls_info = None      # (TLS version, cipher, certificate fingerprint) or None for plain TCP
+        self.tls_info = None
         self.family = "IPv4"
         self.lock = threading.Lock()
-        # traffic counters (read by the Network window)
+        # traffic counters for the Network window
         self.tx_bytes = self.rx_bytes = self.tx_msgs = self.rx_msgs = 0
         self.pings_sent = 0
         self.last_rtt = None
-        self.tx_raw = self.rx_raw = 0         # bytes before compression (to show what compression saved)
-        self.trace = deque(maxlen=3000)       # every frame sent/received, for the packet inspector
+        self.tx_raw = self.rx_raw = 0
+        self.trace = deque(maxlen=3000)  # for the packet inspector
         self.trace_n = 0
 
     def record(self, direction, msg, wire, raw, z, retx=False):
@@ -140,7 +130,7 @@ class Net:
         self.trace.append((self.trace_n, time.time(), direction, msg, wire, raw, z, retx))
 
     def _put(self, s, msg, retx=False):
-        """Encode, compress if that helps, send. Caller holds self.lock (or is the only sender)."""
+        """Encode, compress if it helps, and send. Caller holds self.lock."""
         plain = encode_msg(msg)
         frame = compress_frame(plain)
         s.sendall(frame)
@@ -155,12 +145,12 @@ class Net:
         if tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ctx.check_hostname = False            # self-signed certificate: no CA can vouch for it, so we
-            ctx.verify_mode = ssl.CERT_NONE       # check its fingerprint ourselves (check(), trust on first use)
-            if os.environ.get("SSLKEYLOGFILE"):   # lets Wireshark decrypt the session (for the demo/report)
+            ctx.check_hostname = False  # self-signed, so we check the fingerprint ourselves
+            ctx.verify_mode = ssl.CERT_NONE
+            if os.environ.get("SSLKEYLOGFILE"):  # lets Wireshark decrypt the session
                 ctx.keylog_filename = os.environ["SSLKEYLOGFILE"]
             try:
-                s = ctx.wrap_socket(s)            # TLS handshake
+                s = ctx.wrap_socket(s)
             except (ssl.SSLError, OSError):
                 s.close()
                 raise
@@ -171,7 +161,7 @@ class Net:
                 raise CertRejected("server certificate not trusted")
         else:
             self.tls_info = None
-        s.settimeout(TIMEOUT_SEC)       # server answers our PING every 1 s; 15 s of silence = dead link
+        s.settimeout(TIMEOUT_SEC)
         self.family = "IPv6" if s.family == socket.AF_INET6 else "IPv4"
         self.sock, self.gen = s, self.gen + 1
         self.open, self.target = True, ((host, port), tls)
@@ -198,8 +188,8 @@ class Net:
         while gen == self.gen:
             time.sleep(HEARTBEAT_SEC)
             self.pings_sent += 1
-            # timestamp is echoed back by the server in PONG -> round-trip time; we also tell the
-            # server our last RTT so every client can show everyone's latency
+            # The server echoes the timestamp in PONG so we get the RTT; we report our last
+            # RTT back so everyone can see everyone's latency.
             self.send({"type": "PING", "t": time.time() * 1000, "rtt": self.last_rtt}, s)
 
     def send(self, msg, s=None, retx=False):
@@ -209,7 +199,7 @@ class Net:
                 self._put(s, msg, retx)
         except AttributeError:
             pass
-        except OSError:            # broken connection: wake the reader so reconnecting starts right away
+        except OSError:  # wake the reader so it starts reconnecting
             try:
                 s.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -218,8 +208,8 @@ class Net:
     def close(self):
         self.gen += 1
         self.open = False
-        try:                    # shutdown first: a plain close() while the reader thread is blocked in recv()
-            self.sock.shutdown(socket.SHUT_RDWR)      # may not reach the server, which then still shows us online
+        try:  # shutdown() so the server notices right away even if the reader is blocked in recv()
+            self.sock.shutdown(socket.SHUT_RDWR)
         except (OSError, AttributeError):
             pass
         try:
@@ -234,10 +224,10 @@ class App(tk.Tk):
         self.title("LAN Whiteboard")
         self.q = queue.Queue()
         self.net = Net(self.q)
-        self.conn = None          # (host, port)
+        self.conn = None
         self.me = self.password = ""
         self.use_tls = DEFAULT_TLS
-        self.jwt, self.jwt_user, self.jwt_exp, self.jwt_server = None, "", 0, None   # login (JSON Web Token)
+        self.jwt, self.jwt_user, self.jwt_exp, self.jwt_server = None, "", 0, None  # JWT
         self.my_rooms, self.pending, self.awaiting = [], None, False
         self.tick_gen = 0
         self.reset_session()
@@ -246,8 +236,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def reset_session(self):
-        """Per-session state (also used when going back to the login screen)."""
-        self.objs = {}            # id -> {"obj", "visible"}
+        """Reset everything tied to one session."""
+        self.objs = {}
         self.last_seq = 0
         self.resyncing = False
         self.room = self.token = ""
@@ -255,43 +245,43 @@ class App(tk.Tk):
         self.role = "editor"
         self.users = []
         self.reconnecting = False
-        self.offline = False      # connection is gone for good (kicked / room no longer exists)
-        self.outbox = {}          # msg_id -> request not yet ACKed by the server (insertion ordered)
+        self.offline = False  # kicked, or the room is gone
+        self.outbox = {}  # msg_id -> request waiting for an ACK
         self.resent = self.acked = 0
-        self.rn = 0               # request number of the newest reliable request
+        self.rn = 0
         self.sent_at, self.rto_tries, self.retx, self.dup_acks = 0.0, 0, 0, 0
         self.resync_at, self.seq_at_pong, self.hb_resyncs = 0.0, -1, 0
         self.chaos, self.backups, self.web_port, self.kinds = None, [], None, {}
         self.rc_target, self.failovers = None, 0
-        self.pts_raw = self.pts_sent = 0      # stroke points before / after simplification
+        self.pts_raw = self.pts_sent = 0
         self.labwin = self.inspwin = self.replaywin = self.qrwin = None
-        self.e2e_keys, self.sealed, self.pending_plain = None, {}, {}   # end-to-end encryption
-        self.cfg = {"voice": False, "e2e": False}   # room switches, set by the host only (ROOM_SET)
-        self.banned = []                            # people the host removed (the host can let them back in)
-        self.voice_wanted = False                   # host: open the voice window once the room switch is on
-        self.file_out = {}                    # offer id -> p2p.Sender (files I am offering)
+        self.e2e_keys, self.sealed, self.pending_plain = None, {}, {}
+        self.cfg = {"voice": False, "e2e": False}  # set by the host
+        self.banned = []
+        self.voice_wanted = False  # host asked for voice, open it once the server confirms
+        self.file_out = {}
         if getattr(self, "vc", None):
             self.close_voice()
         self.voice_port, self.vc, self.audio, self.voicewin = None, None, None, None
         self.live, self.cursors, self.erased = {}, {}, set()
-        self.rtts = deque(maxlen=60)          # recent round-trip samples (ms)
+        self.rtts = deque(maxlen=60)
         self.pongs = 0
         self.srv_stats, self.peers = {}, {}
         self.dup_ops = self.gaps = self.reconnects = 0
-        self.rate = (0.0, 0.0)               # (up B/s, down B/s)
+        self.rate = (0.0, 0.0)
         self.peak_down = self.peak_up = 0.0
         self._last_bytes = (self.net.tx_bytes, self.net.rx_bytes)
         self.t_start = time.time()
         self.netwin = None
-        self.photos, self.hist = {}, None   # image cache (Tk drops unreferenced images), history window
+        self.photos, self.hist = {}, None  # Tk drops images that aren't referenced
         self.tool, self.color, self.width = "pen", "#000000", 3
         self.cur, self.cur_pts, self.last_live, self.last_cursor = None, [], 0, 0
-        self.drag = None          # select tool: {"ids", "x0", "y0", "dx", "dy"} while the selection is being dragged
-        self.sel = set()          # select tool: ids of the selected objects (dashed frames)
-        self.band = None          # select tool: (x0, y0) while a selection rectangle is dragged over empty board
-        self.moves = {}           # msg_id of my MOVE -> ids, redrawn from the server's state once ACKed
+        self.drag = None
+        self.sel = set()
+        self.band = None
+        self.moves = {}  # my MOVE msg_id -> ids, redrawn from the server once ACKed
 
-    # ------------------------------------------------------------ login screen
+    # Login screen
     def build_login(self):
         self.login = f = ttk.Frame(self, padding=16)
         f.pack()
@@ -357,11 +347,11 @@ class App(tk.Tk):
         ttk.Button(f, text="Join room", command=lambda: self.start("JOIN_ROOM")).grid(row=r, column=1, sticky="w")
         self.found = []
         self.show_auth()
-        self.after(100, self.find_servers)      # search once automatically
+        self.after(100, self.find_servers)
 
     def find_servers(self):
         if hasattr(self, "canvas") or not self.find_btn.winfo_exists():
-            return                                  # already joined a room
+            return
         self.find_btn.config(state="disabled")
         self.srv_list.delete(0, "end")
         self.srv_list.insert("end", "Searching the LAN (UDP broadcast)...")
@@ -398,7 +388,7 @@ class App(tk.Tk):
         return (v["host"], int(v["port"] or DEFAULT_PORT)), bool(self.tls_var.get()), v
 
     def send_first(self, msg):
-        """Send a login-screen request, opening a connection first if there is none to this server."""
+        """Send a login-screen request, connecting first if needed."""
         conn, tls, _ = self.target()
         self.conn, self.use_tls = conn, tls
         self.awaiting = True
@@ -416,7 +406,7 @@ class App(tk.Tk):
                                  "If the server runs with --no-tls, untick 'Encrypted connection'.")
         except (ConnectionResetError, ConnectionAbortedError) as e:
             self.awaiting = False
-            # a plain server closes the connection on a TLS ClientHello: Linux reports an SSLError, Windows a reset
+            # a plain-TCP server drops a TLS ClientHello: SSLError on Linux, reset on Windows
             hint = ("\n\nIf the server runs with --no-tls, untick 'Encrypted connection'." if tls else
                     "\n\nIf the server uses TLS, tick 'Encrypted connection'.")
             messagebox.showerror("Cannot connect", f"{e}{hint}")
@@ -425,7 +415,7 @@ class App(tk.Tk):
             messagebox.showerror("Cannot connect", str(e))
 
     def auth(self, kind):
-        """Log in / register: the password goes to the server once (inside TLS); we get a JWT back."""
+        """Log in or register. The password is sent once (over TLS) and we keep the JWT."""
         conn, tls, v = self.target()
         if not v["user"] or not v["apw"]:
             return messagebox.showerror("Account", "Enter a username and a password")
@@ -438,12 +428,12 @@ class App(tk.Tk):
         msg = {"type": kind, "user": v["user"], "room": v["room"], "password": v["pw"], "z": 1}
         self.password = v["pw"]
         if self.jwt and self.jwt_server == (conn, tls) and self.jwt_user.lower() == (v["user"] or self.jwt_user).lower():
-            msg["jwt"] = self.jwt                   # already logged in on this server
+            msg["jwt"] = self.jwt
             self.me = self.jwt_user
-        elif v["apw"]:                              # not logged in yet: log in, then send this
+        elif v["apw"]:  # log in first, then send this
             self.pending = msg
             return self.auth("LOGIN")
-        else:                                       # servers started with --no-auth need no account
+        else:
             if not v["user"]:
                 return messagebox.showerror("Error", "Enter a username (and your password to log in)")
             self.me = v["user"]
@@ -471,7 +461,7 @@ class App(tk.Tk):
         if self.jwt and not self.my_rooms:
             self.rooms_list.insert("end", "No rooms yet - create one below.")
 
-    # ---- TLS certificate check: trust on first use (like SSH's known_hosts)
+    # TLS certificate check (trust on first use, like SSH)
     @staticmethod
     def load_known():
         try:
@@ -489,7 +479,7 @@ class App(tk.Tk):
             pass
 
     def check_cert(self, host, port, fp):
-        """Called (in the Tk thread) right after the TLS handshake, before anything is sent."""
+        """Check the server's certificate right after the TLS handshake (Tk thread)."""
         known, key = self.load_known(), f"{host}:{port}"
         if known.get(key) == fp:
             return True
@@ -511,10 +501,10 @@ class App(tk.Tk):
         return False
 
     def check_cert_silent(self, host, port, fp):
-        """Same check for automatic reconnects (no dialog from a worker thread): only the known certificate."""
+        """Same check for automatic reconnects, without a dialog: only the known certificate passes."""
         return self.load_known().get(f"{host}:{port}") == fp
 
-    # ------------------------------------------------------------ main UI
+    # Main UI
     def build_main(self):
         self.login.destroy()
         self.title(f"LAN Whiteboard - room {self.room} - {self.me}")
@@ -524,7 +514,7 @@ class App(tk.Tk):
         for t in ("select", "pen", "eraser", "line", "rect", "oval", "text", "sticky", "image", "laser"):
             ttk.Radiobutton(bar, text=t.title(), value=t, variable=self.tool_var,
                             command=self.set_tool).pack(side="left", padx=2)
-            if t == "select":                       # select everything, then drag any object to move the lot
+            if t == "select":
                 ttk.Button(bar, text="All", width=4, command=lambda: self.select_all(button=True)).pack(side="left")
         self.color_btn = tk.Button(bar, text="  Color  ", bg=self.color, fg="white", command=self.pick_color)
         self.color_btn.pack(side="left", padx=6)
@@ -543,7 +533,7 @@ class App(tk.Tk):
         if self.me == self.host_user:
             for b in self.host_btns:
                 b.pack(side="left", padx=2)
-        foot = ttk.Frame(self)               # status bar: room code, connection state, live latency
+        foot = ttk.Frame(self)
         foot.pack(side="bottom", fill="x")
         self.status = ttk.Label(foot, text=f"Room code: {self.room}", foreground="#006")
         self.status.pack(side="left", padx=8)
@@ -607,22 +597,23 @@ class App(tk.Tk):
         self.bind("<Escape>", self.select_none)
 
     def send_reliable(self, msg):
-        """Send a request that must not be lost: it keeps a msg_id and stays in the outbox until ACKed.
-        If the connection is down, the send fails silently and the request goes out after reconnecting."""
+        """Send a request that must not get lost: it stays in the outbox until ACKed.
+        If we're offline it simply goes out after the reconnect.
+        """
         msg["msg_id"] = uuid.uuid4().hex
-        if msg.get("type") == "ADD" and self.e2e_keys and self.cfg["e2e"]:   # end-to-end: send ciphertext only
+        if msg.get("type") == "ADD" and self.e2e_keys and self.cfg["e2e"]:
             o = msg["obj"]
             self.pending_plain[o["id"]] = o
             body = json.dumps({k: v for k, v in o.items() if k != "id"}, separators=(",", ":")).encode("utf-8")
             msg["obj"] = {"id": o["id"], "kind": "enc", "color": "#000000", "width": 1, "points": [[0, 0]],
                           "data": e2e.seal(self.e2e_keys, body)}
         self.rn += 1
-        msg["rn"] = self.rn                     # request number: the server handles requests in this order
+        msg["rn"] = self.rn
         if not self.outbox:
             self.sent_at, self.rto_tries = time.time(), 0
         self.outbox[msg["msg_id"]] = msg
         self.net.send(msg)
-        if self.reconnecting:                   # offline mode: show it locally and count it
+        if self.reconnecting:  # offline: show it locally
             self.canvas.delete("preview")
             self.draw_pending()
             self.show_offline()
@@ -633,13 +624,14 @@ class App(tk.Tk):
             self.resent += 1
 
     def rto(self):
-        """Retransmission timeout in seconds: 3 x the average measured round trip, within 0.6 .. 3 s."""
+        """Retransmit timeout: 3x the average RTT, kept between 0.6 and 3 s."""
         r = list(self.rtts)
         return min(3.0, max(0.6, 3 * sum(r) / len(r) / 1000)) if r else 1.0
 
     def rto_tick(self, gen):
-        """Retransmit timer, 5 times a second. When the oldest unACKed request times out, send ALL
-        unACKed requests again in order, and wait twice as long before the next round."""
+        """Runs 5 times a second. When the oldest unACKed request times out, resend all of
+        them in order and double the timeout.
+        """
         if gen != self.tick_gen or not hasattr(self, "canvas"):
             return
         now = time.time()
@@ -650,7 +642,7 @@ class App(tk.Tk):
                     self.retx += 1
                 self.sent_at, self.rto_tries = now, self.rto_tries + 1
             if self.resyncing and now - self.resync_at > max(1.5, self.rto()):
-                self.resync_at = now               # the resync request or its answer was lost: ask again
+                self.resync_at = now  # lost the resync or its answer, ask again
                 self.net.send({"type": "RESYNC_REQ", "since": self.last_seq})
         self.after(200, self.rto_tick, gen)
 
@@ -677,7 +669,7 @@ class App(tk.Tk):
     def send_chat(self, _e):
         t = self.chat_entry.get().strip()
         if t:
-            if self.e2e_keys and self.cfg["e2e"]:   # the server relays and stores only ciphertext
+            if self.e2e_keys and self.cfg["e2e"]:
                 t = e2e.PREFIX + e2e.seal(self.e2e_keys, t[:600].encode("utf-8"))
             self.send_reliable({"type": "CHAT", "text": t})
             self.chat_entry.delete(0, "end")
@@ -700,7 +692,7 @@ class App(tk.Tk):
         return self.users[sel[0]]["name"] if sel and sel[0] < len(self.users) else None
 
     def selected_removed(self):
-        """Host: the removed person selected in the list (they are listed below the participants)."""
+        """The removed person selected in the host's list, if any."""
         sel = self.plist.curselection()
         i = sel[0] - len(self.users) if sel else -1
         return self.banned[i] if 0 <= i < len(self.banned) else None
@@ -716,13 +708,13 @@ class App(tk.Tk):
                                 parent=self)
 
     def exit_room(self):
-        """Leave the room and go back to the join screen. The app stays open; the room goes on without us."""
+        """Leave the room and go back to the join screen."""
         waiting = len(self.outbox)
         if not messagebox.askyesno("Exit room", f"Leave room {self.room} and go back to the join screen?"
                                    + (f"\n\n{waiting} action(s) made while offline were not delivered yet and "
                                       "will be lost." if waiting and self.reconnecting else ""), parent=self):
             return
-        self.offline, self.reconnecting = True, False       # no automatic reconnect: this is on purpose
+        self.offline, self.reconnecting = True, False
         self.back_to_login()
 
     def toggle_role(self):
@@ -741,13 +733,13 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            if Image:                                   # resize to <= 400px and re-encode as PNG
+            if Image:  # shrink to 400px and re-encode as PNG
                 im = Image.open(path).convert("RGBA")
                 im.thumbnail((400, 400))
                 buf = io.BytesIO()
                 im.save(buf, "PNG")
                 raw, w, h = buf.getvalue(), im.width, im.height
-            else:                                       # no Pillow: Tk can only read PNG/GIF as-is
+            else:
                 raw = open(path, "rb").read()
                 if not path.lower().endswith((".png", ".gif")):
                     return messagebox.showerror("Image", "Install Pillow (pip install pillow) for JPEG/BMP images")
@@ -763,7 +755,7 @@ class App(tk.Tk):
         self.send_reliable({"type": "ADD", "obj": obj})
 
     def export(self):
-        """PNG export: redraw all visible objects with Pillow (PostScript fallback without it)."""
+        """Export the board as PNG with Pillow (PostScript if Pillow isn't installed)."""
         if not Image:
             p = filedialog.asksaveasfilename(defaultextension=".ps", filetypes=[("PostScript", "*.ps")])
             if p:
@@ -786,7 +778,7 @@ class App(tk.Tk):
                 except OSError:
                     pass
             return ImageFont.load_default(size)
-        for rec in self.objs.values():                  # dict order = creation order = z-order
+        for rec in self.objs.values():  # dict order is creation order, which is also z-order
             if not rec["visible"]:
                 continue
             o, pts, col, w = rec["obj"], rec["obj"]["points"], rec["obj"]["color"], int(rec["obj"]["width"])
@@ -819,7 +811,7 @@ class App(tk.Tk):
         import textwrap
         return "\n".join(textwrap.wrap(text, n)[:6])
 
-    # ---- version history (host can save and restore; everyone can look)
+    # Version history
     def open_history(self):
         if self.hist and self.hist.winfo_exists():
             self.hist.lift()
@@ -854,7 +846,7 @@ class App(tk.Tk):
             for v in versions:
                 self.hist_list.insert("end", f"{v['ts']}  {v['label']}  ({v['count']} objects)")
 
-    # ------------------------------------------------------------ drawing input
+    # Drawing input
     def set_tool(self):
         self.tool = self.tool_var.get()
         self.canvas.config(cursor="fleur" if self.tool == "select" else "")
@@ -867,12 +859,12 @@ class App(tk.Tk):
 
     def on_move(self, e):
         now = time.time()
-        if now - self.last_cursor > 0.07:          # throttle cursor traffic (~14/s)
+        if now - self.last_cursor > 0.07:  # about 14 per second
             self.last_cursor = now
             self.net.send({"type": "CURSOR", "x": e.x, "y": e.y})
 
     def laser_at(self, x, y, user=None):
-        """Laser pointer: a red dot that everyone sees for a moment; never stored."""
+        """Laser pointer: a red dot everyone sees briefly. Not stored."""
         if user is None:
             self.net.send({"type": "LASER", "x": x, "y": y})
         it = self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#ff1744", outline="#ff8a80", width=3, tags="laser")
@@ -880,7 +872,7 @@ class App(tk.Tk):
         self.after(700, lambda: self.canvas.delete(it))
 
     def on_press(self, e):
-        if self.tool == "laser" and not self.offline:     # viewers may point too
+        if self.tool == "laser" and not self.offline:
             return self.laser_at(e.x, e.y)
         if not self.can_draw():
             return
@@ -922,7 +914,7 @@ class App(tk.Tk):
             self.cur_pts.append([e.x, e.y])
             self.canvas.create_line(lx, ly, e.x, e.y, fill=self.color, width=self.width,
                                     capstyle="round", tags="preview")
-            if time.time() - self.last_live > 0.04 and not self.e2e_keys:   # a live preview would leak the stroke
+            if time.time() - self.last_live > 0.04 and not self.e2e_keys:  # a live preview would leak the stroke
                 self.last_live = time.time()
                 self.net.send({"type": "LIVE", "color": self.color, "width": self.width,
                                "points": self.cur_pts[-50:]})
@@ -938,7 +930,7 @@ class App(tk.Tk):
         if not self.can_draw() or not self.cur_pts:
             return
         if self.tool == "pen":
-            pts = simplify(self.cur_pts, 1.0)      # Ramer-Douglas-Peucker: same shape, far fewer points
+            pts = simplify(self.cur_pts, 1.0)
             self.pts_raw += len(self.cur_pts)
             self.pts_sent += len(pts)
             self.send_add("stroke", pts)
@@ -952,14 +944,10 @@ class App(tk.Tk):
             obj["text"] = text
         self.send_reliable({"type": "ADD", "obj": obj})
 
-    # ---- select tool: pick one object or many, drag them, release -> one MOVE request (synced to everyone)
-    #   click an object            select it (and drag it)
-    #   Shift + click              add it to / take it out of the selection
-    #   drag over empty board      selection rectangle: everything it touches is selected
-    #   Ctrl + A                   select everything; Esc clears the selection
-    #   drag any selected object   the whole selection moves together
+    # Select tool: click an object, Shift+click to add/remove, drag on empty board for a
+    # selection rectangle, Ctrl+A for all. Dragging moves the whole selection as one MOVE.
     def object_at(self, x, y, r=4):
-        """Id of the topmost visible object under (x, y), or None."""
+        """Id of the topmost visible object at (x, y), or None."""
         for item in reversed(self.canvas.find_overlapping(x - r, y - r, x + r, y + r)):
             if self.canvas.itemcget(item, "state") == "hidden":
                 continue
@@ -969,7 +957,7 @@ class App(tk.Tk):
         return None
 
     def objects_in(self, x0, y0, x1, y1):
-        """Ids of the visible objects that the rectangle touches."""
+        """Ids of the visible objects touching the rectangle."""
         found = set()
         for item in self.canvas.find_overlapping(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)):
             if self.canvas.itemcget(item, "state") == "hidden":
@@ -983,11 +971,11 @@ class App(tk.Tk):
         oid = self.object_at(e.x, e.y)
         shift = bool(getattr(e, "state", 0) & 0x0001)
         self.drag = self.band = None
-        if oid is None:                       # empty board: start a selection rectangle
+        if oid is None:
             if not shift:
                 self.sel.clear()
             self.band = (e.x, e.y)
-        elif shift:                           # add / remove one object
+        elif shift:
             self.sel ^= {oid}
         elif oid not in self.sel:
             self.sel = {oid}
@@ -996,7 +984,7 @@ class App(tk.Tk):
         self.show_selection()
 
     def select_all(self, _e=None, button=False):
-        typing = isinstance(self.focus_get(), (tk.Entry, ttk.Entry, tk.Text))     # Ctrl+A in the chat box is not for us
+        typing = isinstance(self.focus_get(), (tk.Entry, ttk.Entry, tk.Text))
         if (typing and not button) or not self.room or not self.can_draw():
             return
         if self.tool != "select":
@@ -1012,7 +1000,7 @@ class App(tk.Tk):
             self.show_selection()
 
     def show_selection(self):
-        """Dashed blue frame around every selected object (objects that were erased meanwhile drop out)."""
+        """Draw a dashed frame around each selected object."""
         self.canvas.delete("sel")
         self.sel = {i for i in self.sel if i in self.objs and self.objs[i]["visible"]}
         for oid in self.sel:
@@ -1029,7 +1017,7 @@ class App(tk.Tk):
     def band_done(self, e):
         (x0, y0), self.band = self.band, None
         self.canvas.delete("band")
-        if abs(e.x - x0) > 2 or abs(e.y - y0) > 2:        # a plain click on empty board only clears
+        if abs(e.x - x0) > 2 or abs(e.y - y0) > 2:
             self.sel |= self.objects_in(x0, y0, e.x, e.y)
         self.show_selection()
 
@@ -1038,7 +1026,7 @@ class App(tk.Tk):
         ddx, ddy = e.x - d["x0"] - d["dx"], e.y - d["y0"] - d["dy"]
         if ddx or ddy:
             for oid in d["ids"]:
-                self.canvas.move("o_" + oid, ddx, ddy)       # local preview; nothing is sent until release
+                self.canvas.move("o_" + oid, ddx, ddy)  # preview only, sent on release
             self.canvas.move("sel", ddx, ddy)
             d["dx"] += ddx
             d["dy"] += ddy
@@ -1046,14 +1034,14 @@ class App(tk.Tk):
     def drop(self):
         d, self.drag = self.drag, None
         if d["dx"] or d["dy"]:
-            for k in range(0, len(d["ids"]), MOVE_MAX_IDS):      # the server takes at most 500 ids per MOVE
+            for k in range(0, len(d["ids"]), MOVE_MAX_IDS):
                 ids = d["ids"][k:k + MOVE_MAX_IDS]
                 msg = {"type": "MOVE", "ids": ids, "dx": d["dx"], "dy": d["dy"]}
                 self.send_reliable(msg)
                 self.moves[msg["msg_id"]] = ids
 
     def shift_obj(self, oid, dx, dy):
-        """Apply a MOVE to my copy of one object (also to its sealed form, so it lands right once decrypted)."""
+        """Apply a MOVE to my copy of an object (and its sealed form, if encrypted)."""
         if oid in self.objs:
             o = self.objs[oid]["obj"]
             o = self.objs[oid]["obj"] = {**o, "points": [[x + dx, y + dy] for x, y in o["points"]]}
@@ -1075,15 +1063,15 @@ class App(tk.Tk):
             self.erased |= hits
             self.send_reliable({"type": "ERASE", "ids": list(hits)})
 
-    # ------------------------------------------------------------ rendering
+    # Rendering
     def make_item(self, kind, pts, color, width, text, tags, canvas=None):
         c = canvas or self.canvas
-        if kind == "enc":                 # end-to-end encrypted and we have no (or the wrong) key: nothing to draw
+        if kind == "enc":  # encrypted and we don't have the key
             return None
         if kind == "image":
             ph = self.photos.get(tags[-1])
             if ph is None:
-                ph = self.photos[tags[-1]] = tk.PhotoImage(master=self, data=text)    # `text` carries base64 data here
+                ph = self.photos[tags[-1]] = tk.PhotoImage(master=self, data=text)  # base64 image data
             return c.create_image(*pts[0], image=ph, anchor="nw", tags=tags)
         if kind == "stroke":
             if len(pts) == 1:
@@ -1114,7 +1102,7 @@ class App(tk.Tk):
         self.canvas.itemconfigure("o_" + obj["id"], state="normal" if visible else "hidden")
 
     def load_snapshot(self, snap):
-        """Replace everything from a full snapshot (join, reconnect, or big gap)."""
+        """Replace everything with a full snapshot (join, reconnect or a big gap)."""
         self.canvas.delete("all")
         self.live.clear(); self.cursors.clear(); self.erased.clear(); self.photos.clear()
         self.objs, self.sealed = {}, {}
@@ -1128,8 +1116,8 @@ class App(tk.Tk):
     def apply_op(self, op):
         if op["seq"] <= self.last_seq:
             self.dup_ops += 1
-            return                                  # duplicate / already applied
-        if op["seq"] != self.last_seq + 1:          # gap: ask the server for what we missed
+            return  # already have it
+        if op["seq"] != self.last_seq + 1:  # missed something, ask for it
             if not self.resyncing:
                 self.resyncing = True
                 self.resync_at = time.time()
@@ -1144,14 +1132,14 @@ class App(tk.Tk):
             self.draw_obj(o, True)
             if op.get("by") == self.me:
                 self.canvas.delete("preview")
-                self.draw_pending()                 # the ones still waiting for their turn stay visible
+                self.draw_pending()
             if op.get("by") in self.live:
                 self.canvas.delete(self.live.pop(op["by"]))
         elif op["op"] == "MOVE":
             for i in op["ids"]:
                 if self.drag and i in self.drag["ids"] and op.get("by") != self.me:
-                    d, self.drag = self.drag, None      # someone else moved it under my mouse: theirs wins
-                    for j in d["ids"]:                  # put my preview back where the objects really are
+                    d, self.drag = self.drag, None  # someone else moved it while I was dragging, theirs wins
+                    for j in d["ids"]:
                         if j in self.objs:
                             self.draw_obj(self.objs[j]["obj"], self.objs[j]["visible"])
                 self.shift_obj(i, op["dx"], op["dy"])
@@ -1164,16 +1152,16 @@ class App(tk.Tk):
                     self.canvas.itemconfigure("o_" + i, state="normal" if op["visible"] else "hidden")
                 self.erased.discard(i)
             if self.sel and not self.drag:
-                self.show_selection()               # an erased object leaves the selection
+                self.show_selection()
 
-    # ------------------------------------------------------------ message pump
+    # Message pump
     def pump(self):
         try:
             while True:
                 m = self.q.get_nowait()
                 try:
                     self.handle(m)
-                except Exception:                  # one bad message must never stop the message pump
+                except Exception:
                     import traceback
                     traceback.print_exc()
         except queue.Empty:
@@ -1188,10 +1176,10 @@ class App(tk.Tk):
             self.jwt, self.jwt_user, self.jwt_exp = m["jwt"], m["user"], m["exp"]
             self.jwt_server, self.me, self.my_rooms = (self.conn, self.use_tls), m["user"], m.get("rooms", [])
             if hasattr(self, "vars"):
-                self.vars["apw"].set("")            # the password is not needed any more: the token is used
+                self.vars["apw"].set("")
                 self.vars["user"].set(m["user"])
             self.show_auth()
-            if self.pending:                        # Create/Join was clicked before logging in
+            if self.pending:
                 msg, self.pending = self.pending, None
                 msg["jwt"] = self.jwt
                 self.awaiting = True
@@ -1218,7 +1206,7 @@ class App(tk.Tk):
                 self.reconnects += 1
             self.reconnecting = False
             if was_reconnect and self.rc_target and self.rc_target != (self.conn, self.use_tls):
-                old = self.conn                       # we are on a standby that took over: stay with it
+                old = self.conn
                 self.conn, self.use_tls = self.rc_target
                 if self.jwt:
                     self.jwt_server = (self.conn, self.use_tls)
@@ -1231,11 +1219,11 @@ class App(tk.Tk):
             self.web_port, self.voice_port = m.get("web"), m.get("voice")
             self.banned = m.get("banned", [])
             self.set_cfg(m.get("cfg", {}))
-            if self.vc:                               # voice follows the board to the new connection
+            if self.vc:
                 self.start_voice()
             self.set_backups(m.get("backups", []))
             self.show_chaos(m.get("chaos"))
-            for i, req in enumerate(self.outbox.values(), 1):    # new connection: number the requests from 1
+            for i, req in enumerate(self.outbox.values(), 1):
                 req["rn"] = i
             self.rn, self.sent_at, self.rto_tries = len(self.outbox), time.time(), 0
             self.chat.config(state="normal"); self.chat.delete("1.0", "end"); self.chat.config(state="disabled")
@@ -1245,36 +1233,36 @@ class App(tk.Tk):
             if old:
                 self.add_chat(f"* FAILOVER: {old[0]}:{old[1]} is down - now connected to the standby server "
                               f"{self.conn[0]}:{self.conn[1]}. Nothing was lost.")
-            if was_reconnect and self.outbox:     # whatever the server never confirmed goes out again
+            if was_reconnect and self.outbox:  # resend anything the server never confirmed
                 self.draw_pending()
                 self.add_chat(f"* back online - delivering {len(self.outbox)} action(s) made while offline")
                 self.resend_outbox()
         elif t == "JOIN_ERR" and m.get("code") == "STANDBY" and self.reconnecting:
-            self.net.close()                      # a standby that has not taken over (yet): keep looking
+            self.net.close()
             self.rc_idx += 1
             threading.Thread(target=self._reconnect_loop, args=(1.0,), daemon=True).start()
         elif t == "JOIN_ERR":
             self.net.close()
-            if self.reconnecting:                 # our room is gone (server restarted) or we were banned
+            if self.reconnecting:
                 text = m["text"]
                 if m.get("code") == "NO_ROOM":
                     text = ("The room no longer exists on the server - the server was probably restarted, "
                             "and rooms live only in its memory.")
                 self.go_offline(text)
             else:
-                if m.get("code") == "AUTH":           # token missing, expired or from another server
+                if m.get("code") == "AUTH":
                     self.jwt = None
                     self.show_auth()
                 messagebox.showerror("Cannot join", m["text"])
         elif t == "ACK":
-            for oid in self.moves.pop(m.get("msg_id"), []):     # my drag preview -> the server's position
-                if oid in self.objs:                             # (corrects it if the move was refused)
+            for oid in self.moves.pop(m.get("msg_id"), []):  # snap back to where the server has it
+                if oid in self.objs:
                     self.draw_obj(self.objs[oid]["obj"], self.objs[oid]["visible"])
             if self.sel and not self.drag:
                 self.show_selection()
             if self.outbox.pop(m.get("msg_id"), None) is not None:
                 self.acked += 1
-                self.sent_at, self.rto_tries = time.time(), 0      # progress: restart the retransmit timer
+                self.sent_at, self.rto_tries = time.time(), 0
             if m.get("dup"):
                 self.dup_acks += 1
         elif t == "CHAOS":
@@ -1316,9 +1304,8 @@ class App(tk.Tk):
                 self.net.last_rtt = round(rtt, 1)
             self.srv_stats, self.peers = m.get("stats", {}), m.get("peers", {})
             self.kinds = m.get("kinds", {})
-            # Heartbeat anti-entropy: the PONG says which seq the room is at. If we are still behind on
-            # two PONGs in a row without having moved, the last op(s) were lost with nothing after them
-            # to reveal the gap - so ask for them.
+            # PONG tells us the room's seq. If we're behind on two PONGs in a row, the last ops
+            # were lost with nothing after them to show the gap, so ask for them.
             srv_seq = self.srv_stats.get("room_seq")
             if isinstance(srv_seq, int) and srv_seq > self.last_seq and not self.resyncing and self.room:
                 if self.seq_at_pong == self.last_seq:
@@ -1328,7 +1315,7 @@ class App(tk.Tk):
                 self.seq_at_pong = self.last_seq
             else:
                 self.seq_at_pong = -1
-            if hasattr(self, "canvas"):            # PONGs also arrive while still on the login screen
+            if hasattr(self, "canvas"):
                 self.update_badge()
                 self.refresh_users()
         elif t == "VERSIONS":
@@ -1359,7 +1346,7 @@ class App(tk.Tk):
         elif t == "ERROR":
             self.add_chat("! " + m["text"])
         elif t == "_DISCONNECTED":
-            if not hasattr(self, "canvas"):           # still on the login screen
+            if not hasattr(self, "canvas"):
                 if self.awaiting:
                     self.awaiting = False
                     messagebox.showerror("Disconnected", "The server closed the connection.\n\nIf the server "
@@ -1369,8 +1356,7 @@ class App(tk.Tk):
 
     @staticmethod
     def cursor_tag(user):
-        # Tk splits a tag on spaces, so "cur_Sanjay (web)" never matched canvas.delete() and every
-        # cursor move left a dot behind; hex keeps the tag one word and still unique per user
+        # Tk splits tags on spaces, so use a hex tag for cursor names like "Sanjay (web)".
         return "cur_" + user.encode().hex()
 
     def draw_cursor(self, m):
@@ -1383,7 +1369,7 @@ class App(tk.Tk):
         self.cursors[m["user"]] = tag
 
     def refresh_users(self):
-        keep = self.selected_user()          # keep the host's selection across the 1 Hz refresh
+        keep = self.selected_user()
         keep_removed = self.selected_removed()
         self.plist.delete(0, "end")
         for i, u in enumerate(self.users):
@@ -1396,20 +1382,20 @@ class App(tk.Tk):
                 self.canvas.delete(self.cursor_tag(u["name"]))
             if u["name"] == keep:
                 self.plist.selection_set(i)
-        if self.me == self.host_user:        # the host also sees who was removed, and can let them back in
+        if self.me == self.host_user:
             for name in self.banned:
                 self.plist.insert("end", f"\u2715 {name} (removed)")
                 self.plist.itemconfig("end", fg="#999")
                 if name == keep_removed:
                     self.plist.selection_set("end")
 
-    # ------------------------------------------------------------ network statistics
+    # Network statistics
     def lat_stats(self):
         r = list(self.rtts)
         if not r:
             return None
         diffs = [abs(a - b) for a, b in zip(r, r[1:])]
-        sent_done = max(self.net.pings_sent - 1, 1)     # newest ping may still be in flight
+        sent_done = max(self.net.pings_sent - 1, 1)
         loss = max(0.0, 100.0 * (1 - self.pongs / sent_done)) if self.net.pings_sent > 1 else 0.0
         return dict(now=r[-1], avg=sum(r) / len(r), min=min(r), max=max(r),
                     jitter=sum(diffs) / len(diffs) if diffs else 0.0, loss=min(loss, 100.0))
@@ -1423,9 +1409,9 @@ class App(tk.Tk):
             self.lat_label.config(text=f"● {st['now']:.0f} ms", fg=col)
 
     def net_tick(self, gen):
-        """Once a second: compute throughput from the byte counters and refresh the window."""
+        """Update the throughput numbers once a second."""
         if gen != self.tick_gen or not hasattr(self, "canvas"):
-            return                                   # main screen was closed (back to login)
+            return
         tx, rx = self.net.tx_bytes, self.net.rx_bytes
         self.rate = (tx - self._last_bytes[0], rx - self._last_bytes[1])
         self._last_bytes = (tx, rx)
@@ -1521,7 +1507,7 @@ class App(tk.Tk):
         t.insert("end", "\n".join(L))
         t.config(state="disabled")
 
-    # ------------------------------------------------------------ reconnection
+    # Reconnection
     def start_reconnect(self):
         if self.reconnecting or not hasattr(self, "canvas"):
             return
@@ -1531,14 +1517,15 @@ class App(tk.Tk):
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
     def show_offline(self):
-        """Offline mode: drawing keeps working; every action waits in the outbox and is delivered,
-        once and in order, when the connection (or a standby server) is back."""
+        """Offline mode: keep drawing; everything waits in the outbox and goes out in order
+        once we're connected again.
+        """
         n = len(self.outbox)
         self.status.config(foreground="red", text="OFFLINE - reconnecting. You can keep drawing: "
                            + (f"{n} action(s) saved, sent automatically on reconnect" if n else "nothing waiting"))
 
     def draw_pending(self):
-        """Show my own not-yet-confirmed objects (drawn while offline) so the board does not look empty."""
+        """Show my own unconfirmed objects so the board doesn't look empty while offline."""
         for req in self.outbox.values():
             if req.get("type") == "ADD":
                 o = self.pending_plain.get(req["obj"]["id"], req["obj"])
@@ -1548,7 +1535,7 @@ class App(tk.Tk):
                                    ("preview", "p_" + o["id"]))
 
     def _reconnect_loop(self, wait=0.0):
-        """Try the server we were on, then every standby server we were told about, round and round."""
+        """Try our server, then every standby we know about, round and round."""
         time.sleep(wait)
         while self.reconnecting:
             targets = [(self.conn, self.use_tls)] + [((b["host"], b["port"]), bool(b.get("tls")))
@@ -1561,7 +1548,7 @@ class App(tk.Tk):
                     msg["jwt"] = self.jwt
                 self.rc_target = (conn, tls)
                 self.net.connect(*conn, msg, tls=tls, check=self.check_cert_silent, timeout=2)
-                return                          # JOIN_OK (with fresh snapshot) clears the flag
+                return
             except CertRejected:
                 self.q.put({"type": "_CERT_CHANGED"})
                 return
@@ -1570,8 +1557,9 @@ class App(tk.Tk):
                 time.sleep(1 if len(targets) > 1 else 2)
 
     def go_offline(self, text):
-        """The connection is gone for good (kicked, or the room vanished). Stop reconnecting, keep the
-        board visible so it can still be exported, and offer to go back to the login screen."""
+        """We can't get back in (kicked, or the room is gone). Stop reconnecting, keep the
+        board visible so it can still be exported, and offer to go back to the login screen.
+        """
         self.offline, self.reconnecting = True, False
         self.net.close()
         self.outbox.clear()
@@ -1591,13 +1579,13 @@ class App(tk.Tk):
         self.title("LAN Whiteboard")
         self.build_login()
         if self.jwt and self.jwt_server == (self.conn, self.use_tls):
-            self.send_first({"type": "MY_ROOMS", "jwt": self.jwt})     # refresh "Your rooms"
+            self.send_first({"type": "MY_ROOMS", "jwt": self.jwt})
 
-    # ------------------------------------------------------------ standby servers (failover)
+    # Standby servers (failover)
     def set_backups(self, backups):
-        """The server tells us where its standby servers are. Their TLS certificate fingerprints arrive
-        over the connection we already trust, so we can remember them now and recognise the standby
-        later without asking the user (trust is handed over, not assumed)."""
+        """The server tells us its standbys and their certificate fingerprints, so we can fail
+        over to them later without asking the user.
+        """
         self.backups = [b for b in backups if b.get("host") and b.get("port")]
         known, changed = self.load_known(), False
         for b in self.backups:
@@ -1607,7 +1595,7 @@ class App(tk.Tk):
         if changed:
             self.save_known(known)
 
-    # ------------------------------------------------------------ chaos lab + network map
+    # Chaos lab and network map
     def show_chaos(self, ch):
         self.chaos = ch
         if hasattr(self, "chaos_label"):
@@ -1658,7 +1646,7 @@ class App(tk.Tk):
         self.net.send({"type": "CHAOS_SET", "reset": reset, **{k: v.get() for k, v in self.lab_vars.items()}})
 
     def draw_lab(self):
-        """Network map (server, standby, every online client with its latency) and the repair counters."""
+        """Network map (server, standby, clients with latency) and the repair counters."""
         g, sv = self.lab_map, self.srv_stats
         g.delete("all")
         sx, sy = 280, 50
@@ -1715,7 +1703,7 @@ class App(tk.Tk):
         t.insert("end", "\n".join(L))
         t.config(state="disabled")
 
-    # ------------------------------------------------------------ packet inspector
+    # Packet inspector
     @staticmethod
     def summarize(m):
         t = m.get("type")
@@ -1815,7 +1803,7 @@ class App(tk.Tk):
             self.insp_rows[iid] = rec
             added = True
         kids = tr.get_children()
-        for iid in kids[:max(0, len(kids) - 600)]:            # keep the list short
+        for iid in kids[:max(0, len(kids) - 600)]:
             tr.delete(iid)
             self.insp_rows.pop(iid, None)
         if added:
@@ -1835,7 +1823,7 @@ class App(tk.Tk):
         if not rec:
             return
 
-        def short(v):                                  # do not print 500 KB of image data
+        def short(v):  # don't print huge image data
             if isinstance(v, str) and len(v) > 100:
                 return v[:100] + f"... ({len(v)} chars)"
             if isinstance(v, list) and len(v) > 12:
@@ -1856,7 +1844,7 @@ class App(tk.Tk):
         t.config(state="disabled")
 
     def insp_draw_seq(self):
-        """Message sequence chart of the newest frames: client lifeline on the left, server on the right."""
+        """Sequence chart of the latest frames: client on the left, server on the right."""
         g = self.insp_seq
         g.delete("all")
         recs = [r for r in self.net.trace if self.insp_wanted(r)][-20:]
@@ -1875,9 +1863,9 @@ class App(tk.Tk):
             g.create_text(6, y + 4, anchor="w", fill="#777", font=("Courier", 8),
                           text=time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}")
 
-    # ------------------------------------------------------------ time-travel replay
+    # Replay
     def open_replay(self):
-        self.net.send({"type": "REPLAY_REQ"})          # the answer (REPLAY) opens the window
+        self.net.send({"type": "REPLAY_REQ"})
 
     def show_replay(self, ops):
         if self.replaywin and self.replaywin.winfo_exists():
@@ -1900,11 +1888,12 @@ class App(tk.Tk):
         self.rp_scale.pack(side="left", fill="x", expand=True, padx=6)
         self.rp_label = ttk.Label(row, text="", width=46)
         self.rp_label.pack(side="left")
-        self.rp_goto(len(ops))                          # start at "now"; drag left or press Play to go back
+        self.rp_goto(len(ops))
 
     def rp_goto(self, k):
-        """Show the board as it was after the first k operations. Going forward applies ops one by one
-        (exactly what a client does live); going back starts again from an empty board."""
+        """Show the board after the first k ops. Going forward applies ops one by one;
+        going back replays from an empty board.
+        """
         if not (self.replaywin and self.replaywin.winfo_exists()):
             return
         c, k = self.rp_canvas, max(0, min(k, len(self.rp_ops)))
@@ -1952,7 +1941,7 @@ class App(tk.Tk):
         self.rp_goto(self.rp_pos + 1)
         self.after(int(1000 / int(self.rp_speed.get().split()[0])), self.rp_step)
 
-    # ------------------------------------------------------------ phone / browser join
+    # Phone / browser join
     def show_invite(self, m):
         if not m.get("url"):
             return messagebox.showinfo("Phone join", "The server was started with --no-web (or its web port is "
@@ -1995,10 +1984,11 @@ class App(tk.Tk):
                        f"{time.strftime('%H:%M', time.localtime(m['exp']))}.\nGuests appear as 'name (web)'. "
                        "The browser page uses HTTP + WebSocket on the server's web port.").pack()
 
-    # ------------------------------------------------------------ end-to-end encryption
+    # End-to-end encryption
     def reveal(self, o, track=True):
-        """An object as it should be drawn: end-to-end encrypted ones are decrypted with the room key.
-        Without the right key the object stays sealed (and is remembered, to open when a key is set)."""
+        """Decrypt an end-to-end encrypted object if we have the key. Otherwise keep it
+        sealed and try again when a key is set.
+        """
         if o.get("kind") != "enc":
             return o
         plain = e2e.unseal(self.e2e_keys, o.get("data", "")) if self.e2e_keys else None
@@ -2008,8 +1998,8 @@ class App(tk.Tk):
                 if isinstance(inner, dict) and inner.get("kind") not in (None, "enc") and "points" in inner:
                     if track:
                         self.sealed.pop(o["id"], None)
-                    ox, oy = (o.get("points") or [[0, 0]])[0]      # a moved encrypted object: the server only
-                    if ox or oy:                                      # knows its offset, the shape is inside
+                    ox, oy = (o.get("points") or [[0, 0]])[0]  # the server only knows the offset
+                    if ox or oy:
                         inner["points"] = [[x + ox, y + oy] for x, y in inner["points"]]
                     return {**inner, "id": o["id"], "owner": o.get("owner")}
             except ValueError:
@@ -2019,7 +2009,7 @@ class App(tk.Tk):
         return o
 
     def set_cfg(self, cfg):
-        """Room switches (voice chat, end-to-end encryption). Only the host can flip them; everyone follows."""
+        """Apply the room switches (voice, E2E) set by the host."""
         was = dict(self.cfg)
         self.cfg = {k: bool(cfg.get(k, False)) for k in ("voice", "e2e")}
         if not hasattr(self, "canvas"):
@@ -2027,7 +2017,7 @@ class App(tk.Tk):
         self.show_e2e()
         self.voice_btn.config(text="Voice" if self.cfg["voice"] else "Voice: off")
         if was["voice"] and not self.cfg["voice"] and self.voicewin and self.voicewin.winfo_exists():
-            self.close_voice()                    # the host switched voice chat off: hang up
+            self.close_voice()
             self.voicewin.destroy()
         if self.cfg["voice"] and self.voice_wanted:
             self.voice_wanted = False
@@ -2056,13 +2046,13 @@ class App(tk.Tk):
         if s is None:
             return
         if host:
-            self.cfg["e2e"] = bool(s)             # at once, so nothing I draw meanwhile goes out in clear
+            self.cfg["e2e"] = bool(s)  # set it now so nothing drawn in the meantime goes out unencrypted
             self.net.send({"type": "ROOM_SET", "e2e": bool(s)})
         self.set_e2e(s)
 
     def set_e2e(self, passphrase):
         self.e2e_keys = e2e.derive(passphrase, self.room) if passphrase else None
-        for oid, o in list(self.sealed.items()):          # try the new key on everything still sealed
+        for oid, o in list(self.sealed.items()):
             plain = self.reveal(o)
             if plain is not o and oid in self.objs:
                 self.objs[oid]["obj"] = plain
@@ -2071,7 +2061,7 @@ class App(tk.Tk):
         self.add_chat("* end-to-end key " + ("set: while the host keeps encryption on, your new drawings and chat "
                                              "are unreadable for the server" if self.e2e_keys else "cleared"))
 
-    # ------------------------------------------------------------ peer-to-peer file transfer
+    # Peer-to-peer file transfer
     @staticmethod
     def download_dir():
         if os.environ.get("WB_DOWNLOADS"):
@@ -2088,7 +2078,7 @@ class App(tk.Tk):
             return
         self.file_label.config(text="hashing " + os.path.basename(path) + " ...")
 
-        def prepare():                                   # hashing a big file must not freeze the window
+        def prepare():
             try:
                 sha = p2p.sha256_file(path)
                 token = uuid.uuid4().hex
@@ -2106,7 +2096,7 @@ class App(tk.Tk):
                                    f"It comes directly from {m['from']}'s PC (peer to peer) and is saved in\n"
                                    f"{self.download_dir()}\n\nAccept?", parent=self):
             return self.net.send({"type": "FILE_REPLY", "to": m["from"], "id": m["id"], "status": "declined"})
-        host = self.conn[0] if is_loopback(m["ip"]) else m["ip"]   # sender sits on the server PC: use its LAN address
+        host = self.conn[0] if is_loopback(m["ip"]) else m["ip"]
         self.net.send({"type": "FILE_REPLY", "to": m["from"], "id": m["id"], "status": "accepted"})
         self.add_chat(f"* receiving {m['name']} directly from {m['from']} ({host}:{m['port']}) ...")
 
@@ -2164,9 +2154,9 @@ class App(tk.Tk):
             self.file_label.config(text="")
             self.add_chat("! " + m["text"])
 
-    # ------------------------------------------------------------ voice chat (UDP)
+    # Voice chat
     def start_voice(self):
-        """(Re)connect the voice client to the server we are on now."""
+        """(Re)connect voice to the server we're on."""
         talking = self.vc.talking if self.vc else False
         self.close_voice()
         self.vc = voice.VoiceClient(self.conn[0], self.voice_port, self.room, self.me, self.token)
@@ -2174,7 +2164,7 @@ class App(tk.Tk):
         try:
             self.audio = voice.AudioIO(self.vc)
             self.voice_err = ""
-        except Exception as e:                          # no package, no microphone, no sound card ...
+        except Exception as e:
             self.audio, self.voice_err = None, str(e)
 
     def close_voice(self):
@@ -2198,7 +2188,7 @@ class App(tk.Tk):
             if not messagebox.askyesno("Voice", "Voice chat is off for this room.\n\nTurn it on for everyone?",
                                        parent=self):
                 return
-            self.voice_wanted = True              # the window opens when the server confirms (ROOM message)
+            self.voice_wanted = True
             return self.net.send({"type": "ROOM_SET", "voice": True})
         self.start_voice()
         self.voicewin = w = tk.Toplevel(self)
@@ -2246,7 +2236,7 @@ class App(tk.Tk):
         t.config(state="disabled")
         self.after(500, self.voice_tick)
 
-    # ------------------------------------------------------------ connection diagnostics
+    # Connection diagnostics
     def open_diagnose(self):
         try:
             conn, tls, _ = self.target()
