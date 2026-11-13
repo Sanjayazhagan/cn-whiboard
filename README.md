@@ -25,7 +25,8 @@ empty board to draw a selection rectangle (everything it touches is selected), *
 **All** / **Ctrl+A** to select everything; then drag any selected object and the whole selection moves together as one step
 (one undo puts it all back). **Esc** or a click on empty board clears the selection. Freehand pen, object eraser, line/rectangle/oval/text, colour + width, live remote strokes and cursors in each user's colour,
 participant list with online status, group chat with timestamps, per-user undo/redo (Ctrl+Z / Ctrl+Y),
-host-only Clear / Save / Restore (saved to `saves/<room>.json` on the server), host can switch users between editor/viewer or kick,
+host-only Clear / Save / Restore (saved to `saves/<room>.json` on the server), host can switch users between editor/viewer, kick, and **let removed people back in** (they are listed as `✕ name (removed)`;
+select one and click **Let back in**), an **Exit room** button (desktop and phone) that goes back to the join screen,
 room password, **LAN server discovery (UDP broadcast)**, **sticky notes**, **image insertion** (PNG/GIF; JPEG/BMP need Pillow; resized to <=400px), **PNG export**, **version history**, automatic reconnect (same username + token) with full state recovery, and actions made while the
 connection was down are resent after reconnecting (nothing lost, nothing applied twice).
 
@@ -48,6 +49,10 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
 - Each WebSocket text frame holds the same JSON message the desktop client sends, so the room logic is shared: one server, two transports.
 - **Phone join** (desktop client) shows a **QR code** and link. The link carries a signed **invite JWT** for that one room, valid 1 hour;
   the guest only types a name and appears as `name (web)`. No account password ever travels over the plain-HTTP page.
+- **Each link belongs to the person who opened Phone join**, and at most **2 phones/browsers** can be connected through one person's
+  links at the same time, however often the QR code is shared or re-opened. A third device is refused with a message naming the two
+  devices in use; when one of them presses **Exit** (or closes the page) its place is free again. Guests cannot make links of their own,
+  and a removed person's links stop letting new devices in. Links made by an older server version must be opened again.
   Without an invite, `http://SERVER-IP:8080/` asks for name, account password and room code.
 - The page has select (drag to move; **All** or a selection rectangle to move many), pen, eraser, line, rect, oval, text, sticky, laser, colour, width, undo/redo, chat, live cursors, latency, and the same
   reliability rules (ACK + retransmit timer, seq-gap resync, auto reconnect, failover).
@@ -141,8 +146,9 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
   the data connection is not encrypted.
 
 ### 13. End-to-end encrypted rooms (`e2e.py`)
-- **E2E key**: type a passphrase (everyone uses the same one; it is never sent). From then on that client's drawings and chat are
-  encrypted before they leave the PC, so the server relays and stores only ciphertext: `python db_tool.py ROOMCODE` shows `"kind":"enc"`.
+- **Only the host can turn end-to-end encryption on or off** for the room: the host clicks **E2E key** and types a passphrase
+  (empty = off for everyone). The others then see **E2E: key?** and type the same passphrase (it is never sent). While it is on,
+  each client's drawings and chat are encrypted before they leave the PC, so the server relays and stores only ciphertext: `python db_tool.py ROOMCODE` shows `"kind":"enc"`.
 - Key = PBKDF2-HMAC-SHA256(passphrase, room code, 100 000 rounds). Cipher = HMAC-SHA256 in counter mode as a stream cipher, with an
   HMAC tag (encrypt-then-MAC), standard library only. A wrong key or a changed byte is detected and the object stays hidden.
 - TLS protects client-to-server; this protects against the server itself. Limits: the server still sees who draws when and how big it is;
@@ -150,6 +156,8 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
   re-decrypted when you enter the key later.
 
 ### 14. Voice chat over UDP (`voice.py`)
+- **Only the host can turn voice chat on or off** for the room (the button shows **Voice: off** to the others until then; the host's
+  voice window has **Turn voice chat off for everyone**, which hangs everyone up). While it is off the relay refuses every client.
 - **Voice** opens push-to-talk. Audio is 8 kHz mono, 20 ms per packet, G.711 mu-law (64 kbit/s), sent as UDP datagrams with a sequence
   number and timestamp (the idea of RTP) to a relay in the server (UDP **5053**, `--voice-port`, `--no-voice`), which forwards them to
   the room's other members. A HELLO with the member token registers the client's UDP address.
@@ -196,7 +204,8 @@ All of them work together; the buttons are in the bottom bar of the client (**Ph
   token works until it expires (no logout list); there is no password reset.
 
 ## Robustness
-- **Kick** bans the name in that room: the kicked client is told why (`KICKED`), does not auto-reconnect, and its saved token is refused.
+- **Kick** bans the name in that room: the kicked client is told why (`KICKED`), does not auto-reconnect, and its saved token is refused
+  until the host lets them back in (`UNBAN`). The removed list and the host's voice/E2E switches are saved in the database.
 - **Slow client isolation**: each client has its own outgoing queue and writer thread on the server, so a client that stops reading
   (frozen laptop, full TCP receive window) cannot stall drawing for the others. It is dropped after 15 s or 64 MB of backlog and reconnects.
 - **Image budget**: a room holds at most 20 MB of images (erased ones count, since objects are only hidden), so a joining client's
@@ -267,6 +276,8 @@ and once with TLS (unreadable) makes a strong slide.
 real clients dragging a rectangle, an image and an end-to-end encrypted shape.
 `tests/test_more.py` (no Tkinter) and `tests/test_gui_more.py` cover diagnostics, the dashboard, P2P files with resume, end-to-end
 encryption, the voice relay and jitter buffer, and IPv6 (skipped on a PC without IPv6).
+`tests/test_host_controls.py` (no Tkinter) covers the host-only voice/E2E switches, letting removed people back in and the
+2-phones-per-person invite limit; `tests/test_gui_host.py` runs the same from the desktop client, plus Exit room.
 `tests/test_features.py` (no Tkinter) covers the WebSocket handshake and browser guest join, compression, ordered requests,
 the chaos lab, the replay log and standby failover. `tests/test_gui_features.py` runs two real clients through the chaos lab,
 inspector, replay, phone-join window, laser and a TLS failover.

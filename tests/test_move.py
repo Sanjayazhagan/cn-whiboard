@@ -222,6 +222,8 @@ try:
     print("ok  GUI: an inserted image is dragged to a new spot and moves on the other board too")
 
     # end-to-end encrypted object: the server only shifts its offset, the clients shift the decrypted shape
+    ga.net.send({"type": "ROOM_SET", "e2e": True})      # only the host (ga) can switch E2E on for the room
+    spin(ga, gb, secs=3, until=lambda: ga.cfg["e2e"] and gb.cfg["e2e"])
     ga.set_e2e("pw"); gb.set_e2e("pw")
     ga.tool = "rect"; ga.on_press(E(50, 400)); ga.on_drag(E(90, 440)); ga.on_release(E(90, 440))
     spin(ga, gb, secs=3, until=lambda: len(gb.objs) == 3)

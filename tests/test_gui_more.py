@@ -75,6 +75,8 @@ try:
 
     # ---- end-to-end encryption
     draw(a, 0); spin(a, b, secs=0.8); assert items(b) == 1
+    a.net.send({"type": "ROOM_SET", "e2e": True})       # only the host (alice) can switch E2E on for the room
+    spin(a, b, secs=3, until=lambda: a.cfg["e2e"] and b.cfg["e2e"])
     a.set_e2e("river-42")
     draw(a, 1); a.tool = "text"; a.send_add("text", [[300, 300]], text="SECRET MEETING 5PM")
     a.chat_entry.insert(0, "the password is tiger"); a.send_chat(None)
@@ -120,6 +122,10 @@ try:
     print("ok  P2P file: alice -> bob, 2.5 MB over a direct TCP connection, hash verified, sender closed its port")
 
     # ---- voice
+    b.open_voice(); spin(a, b, secs=0.3)
+    assert b.vc is None and "Voice: off" in b.voice_btn.cget("text")   # off until the host turns it on
+    a.net.send({"type": "ROOM_SET", "voice": True})       # only the host (alice) can switch voice on
+    spin(a, b, secs=3, until=lambda: a.cfg["voice"] and b.cfg["voice"])
     a.open_voice(); b.open_voice(); spin(a, b, secs=1.2)
     assert a.vc.ok and b.vc.ok
     tone = struct.pack("<160h", *[int(9000 * math.sin(i * 2 * math.pi * 300 / 8000)) for i in range(160)])

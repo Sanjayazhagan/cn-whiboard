@@ -37,6 +37,7 @@ canvas{background:#fff;border:1px solid var(--line);max-width:100%;max-height:10
 #log .sys{color:var(--mut);font-style:italic}
 #chat form{display:flex;gap:6px;padding:8px;border-top:1px solid var(--line)}
 #chat input{flex:1}
+#exit{padding:2px 10px;font-size:13px;border-color:var(--bad);color:var(--bad)}
 </style></head><body>
 <div id="join">
   <h1>LAN Whiteboard</h1><p id="sub">Join the shared board from this browser.</p>
@@ -50,7 +51,7 @@ canvas{background:#fff;border:1px solid var(--line);max-width:100%;max-height:10
 </div>
 <div id="app">
   <div id="bar"></div>
-  <div id="status"><span>Room <b id="sroom"></b></span><span id="sme"></span><span id="susers"></span><span id="lat">connecting</span></div>
+  <div id="status"><span>Room <b id="sroom"></b></span><span id="sme"></span><span id="susers"></span><span id="lat">connecting</span><button id="exit" title="Leave this room">Exit</button></div>
   <div id="chaos"></div>
   <div id="wrap"><canvas id="c" width="1000" height="640"></canvas></div>
   <div id="chat"><div id="log"></div><form id="cf"><input id="ci" type="text" maxlength="1000" placeholder="Message" autocomplete="off"><button>Send</button></form></div>
@@ -160,6 +161,12 @@ function showLat() {
 function showChaos(c) {
   const el = $("chaos"); el.style.display = c ? "block" : "none";
   if (c) el.textContent = "⚡ Chaos lab: " + c.loss + "% loss, " + c.delay + " ms delay ± " + c.jitter + " ms" + (c.bw ? ", " + c.bw + " kbit/s cap" : "") + " — the board repairs itself";
+}
+$("exit").onclick = () => exitRoom();
+function exitRoom() {          // leave the room: frees this device's place under the invite (at most 2 per person)
+  if (!confirm("Leave room " + room + "?")) return;
+  dead = true; if (ws) ws.close();
+  location.reload();             // back to the join form; the invite link stays in the address bar
 }
 function showUsers() { $("susers").textContent = users.filter(u => u.online).length + " online"; }
 function sys(t) { const d = document.createElement("div"); d.className = "sys"; d.textContent = t; $("log").appendChild(d); $("log").scrollTop = 1e9; }

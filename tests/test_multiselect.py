@@ -68,7 +68,7 @@ try:
     # ---- drag one of them: both move, as ONE op; the unselected line stays
     press_drag(gb, 100, 125, 150, 325)                                             # grab the rect's left edge: (+50, +200)
     assert gb.canvas.coords("o_" + oval)[:2] == [350.0, 300.0]                     # local preview of the OTHER object
-    spin(ga, gb, secs=4, until=lambda: ga.last_seq == seq0 + 1 and not gb.outbox)
+    spin(ga, gb, secs=4, until=lambda: ga.last_seq == gb.last_seq == seq0 + 1 and not gb.outbox)
     assert ga.last_seq == gb.last_seq == seq0 + 1
     for g in (ga, gb):
         assert pts(g, rect) == [[150, 300], [210, 350]] and pts(g, oval) == [[350, 300], [410, 350]], g.objs
@@ -80,7 +80,7 @@ try:
     print("ok  dragging one selected object moves the whole selection for everyone as one op")
 
     gb.send_reliable({"type": "UNDO"})
-    spin(ga, gb, secs=4, until=lambda: ga.last_seq == seq0 + 2)
+    spin(ga, gb, secs=4, until=lambda: ga.last_seq == gb.last_seq == seq0 + 2)
     assert pts(ga, rect) == [[100, 100], [160, 150]] and pts(ga, oval) == [[300, 100], [360, 150]]
     print("ok  one undo moves the whole group back")
 
@@ -91,7 +91,7 @@ try:
     assert gb.sel == {rect, line}, gb.sel
     spin(ga, gb, secs=0.4); assert gb.last_seq == seq0 + 2 and not gb.outbox
     press_drag(gb, 730, 530, 630, 430)                                             # (-100, -100) for rect + line
-    spin(ga, gb, secs=4, until=lambda: ga.last_seq == seq0 + 3 and not gb.outbox)
+    spin(ga, gb, secs=4, until=lambda: ga.last_seq == gb.last_seq == seq0 + 3 and not gb.outbox)
     assert pts(ga, rect) == [[0, 0], [60, 50]] and pts(ga, line) == [[600, 400], [660, 460]]
     assert pts(ga, oval) == [[300, 100], [360, 150]]
     print("ok  Shift+click adds an object to the selection or takes it out")
@@ -103,7 +103,7 @@ try:
     ga.select_all(button=True)
     assert ga.tool == "select" and ga.sel == {rect, oval, line}
     press_drag(ga, 330, 100, 430, 200)                                             # grab the oval's top: (+100, +100)
-    spin(ga, gb, secs=4, until=lambda: gb.last_seq == seq0 + 4 and not ga.outbox)
+    spin(ga, gb, secs=4, until=lambda: ga.last_seq == gb.last_seq == seq0 + 4 and not ga.outbox)
     for g in (ga, gb):
         assert pts(g, rect) == [[100, 100], [160, 150]] and pts(g, oval) == [[400, 200], [460, 250]]
         assert pts(g, line) == [[700, 500], [760, 560]]
@@ -111,7 +111,7 @@ try:
 
     # ---- an object erased by someone else drops out of my selection
     gb.send_reliable({"type": "ERASE", "ids": [oval]})
-    spin(ga, gb, secs=4, until=lambda: ga.last_seq == seq0 + 5)
+    spin(ga, gb, secs=4, until=lambda: ga.last_seq == gb.last_seq == seq0 + 5)
     assert ga.sel == {rect, line} and len(ga.canvas.find_withtag("sel")) == 2
     ga.select_none()
     assert not ga.sel and not ga.canvas.find_withtag("sel")

@@ -163,6 +163,12 @@ class Relay:
             names = {str(p["id"]): p["user"] for p in self.peers.values() if p["room"] == room}
         self.sock.sendto(MAGIC + bytes([WELCOME]) + json.dumps({"ok": True, "id": sid, "names": names}).encode(), addr)
 
+    def drop_room(self, room):
+        """Forget everyone registered for this room (the host switched voice chat off)."""
+        with self.lock:
+            for a in [a for a, p in self.peers.items() if p["room"] == room]:
+                del self.peers[a]
+
     def _audio(self, data, addr):
         me = self.peers.get(addr)
         if me is None or len(data) > 1500:

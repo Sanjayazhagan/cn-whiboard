@@ -76,6 +76,8 @@ import web
 from webpage import ADMIN_PAGE, PAGE
 
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+INVITE_DEVICES = 2        # browsers/phones that can be connected through ONE member's invite links at a time
+E2E_PREFIX = "e2e1:"      # an end-to-end encrypted chat line (see e2e.py)
 KINDS = {"stroke", "line", "rect", "oval", "text", "sticky", "image", "enc"}   # enc = end-to-end encrypted
 MAX_IMAGE_B64 = 700_000           # ~500 KB image after base64
 MAX_ENC_B64 = 1_000_000           # one end-to-end encrypted object (an encrypted image fits)
@@ -124,6 +126,7 @@ CLUSTER_KEY = ""    # shared secret a standby must present before it is given th
 replicas = []       # connections of standby servers that receive every state change
 WEB = None          # port of the HTTP/WebSocket listener, or None
 VOICE = None        # UDP port of the voice relay, or None
+RELAY = None        # the voice relay itself (voice.Relay)
 TCP_PORT = DEFAULT_PORT
 
 # Chaos lab: which message types may be DROPPED. Only the ones that have a recovery mechanism:
@@ -417,6 +420,7 @@ class Member:
         self.next_rn = 1                   # next request number expected from this client
         self.held = {}                     # rn -> request that arrived before an earlier one (reorder buffer)
         self.rtt = None                    # latest round-trip time (ms) reported by this client
+        self.via = None                    # browser guest: the member whose invite link let it in
 
 
 class Room:
@@ -427,6 +431,7 @@ class Room:
         self.objects = {}      # id -> {"obj":..., "visible": bool}
         self.members = {}      # name -> Member
         self.banned = set()    # names kicked by the host (cannot rejoin, even with their token)
+        self.cfg = {"voice": False, "e2e": False}   # room switches only the host may flip (ROOM_SET)
         self.image_bytes = 0   # base64 size of all images ever added (they are hidden, never deleted)
         self.chat = []
         self.versions = []     # version history: {"id","label","ts","seq","visible":[ids]}
@@ -463,6 +468,10 @@ class Room:
         return [{"name": m.name, "color": m.color, "role": m.role,
                  "online": m.client is not None, "host": m.name == self.host}
                 for m in self.members.values()]
+
+    def users_msg(self):
+        """The participant list, plus the people the host removed (the host can let them back in)."""
+        return {"type": "USERS", "users": self.users_payload(), "banned": sorted(self.banned)}
 
     def broadcast(self, msg, skip=None):
         enc = Encoded(msg)                     # encode once, queue the same bytes for everyone
@@ -622,6 +631,10 @@ def apply_request(client, room, m, t, msg, mid):
     if t == "ADD" and can_edit:
         obj = msg.get("obj", {})
         ok = valid_obj(obj) and obj["id"] not in room.objects
+        if ok and obj["kind"] == "enc" and not room.cfg["e2e"]:
+            ok = False
+            client.send({"type": "ERROR", "text": "Not added: end-to-end encryption is off for this room "
+                                                  "(only the host can turn it on)"})
         if ok and not room.image_fits(obj):
             ok = False
             client.send({"type": "ERROR", "text": "Image not added: this room already holds "
@@ -723,10 +736,16 @@ def apply_request(client, room, m, t, msg, mid):
     elif t == "REPLAY_REQ":                    # time travel: the whole sequenced op log
         client.send({"type": "REPLAY", "ops": room.log})
     elif t == "INVITE_REQ":                    # a signed, short-lived link that lets a browser join this room
-        client.send({"type": "INVITE", **make_invite(room)})
+        if m.via:                              # a guest cannot hand out links of its own (no way round the limit)
+            client.send({"type": "ERROR", "text": "Guests who joined through a link cannot invite others"})
+        else:
+            client.send({"type": "INVITE", **make_invite(room, m.name)})
     elif t == "CHAT":
         text = str(msg.get("text", ""))[:1000].strip()
-        if text:
+        if text.startswith(E2E_PREFIX) and not room.cfg["e2e"]:
+            client.send({"type": "ERROR", "text": "Message not sent: end-to-end encryption is off for this room "
+                                                  "(only the host can turn it on)"})
+        elif text:
             entry = {"type": "CHAT", "user": m.name, "text": text, "ts": time.strftime("%H:%M:%S")}
             room.chat.append(entry)
             persist("add_chat", room.code, entry, mid)
@@ -736,7 +755,7 @@ def apply_request(client, room, m, t, msg, mid):
         if tgt and msg.get("role") in ("editor", "viewer") and tgt.name != room.host:
             tgt.role = msg["role"]
             persist("save_member", room.code, tgt)
-            room.broadcast({"type": "USERS", "users": room.users_payload()})
+            room.broadcast(room.users_msg())
     elif t == "KICK" and is_host:
         tgt = room.members.get(msg.get("user"))
         if tgt and tgt.name != room.host:
@@ -747,8 +766,30 @@ def apply_request(client, room, m, t, msg, mid):
                 tgt.client.send({"type": "KICKED", "text": "You were removed from the room by the host"})
                 tgt.client.room = None         # its connection no longer belongs to the room
                 tgt.client.close_after_flush()
-            room.broadcast({"type": "USERS", "users": room.users_payload()})
+            room.broadcast(room.users_msg())
             room.broadcast({"type": "INFO", "text": f"{tgt.name} was removed by the host"})
+    elif t == "UNBAN" and is_host:             # the host lets a removed person back in
+        name = str(msg.get("user", ""))
+        if name in room.banned:
+            room.banned.discard(name)
+            persist("unban", room.code, name)
+            event(f"[room {room.code}] {name} may join again (host lifted the removal)")
+            room.broadcast(room.users_msg())
+            room.broadcast({"type": "INFO", "text": f"{name} may join again (allowed back by the host)"})
+    elif t == "ROOM_SET" and is_host:          # room switches: voice chat and end-to-end encryption
+        changed = {k: bool(msg[k]) for k in ("voice", "e2e") if k in msg and bool(msg[k]) != room.cfg[k]}
+        if changed:
+            room.cfg.update(changed)
+            persist("set_cfg", room.code, dict(room.cfg))
+            room.broadcast({"type": "ROOM", "cfg": room.cfg, "by": m.name})
+            if changed.get("voice") is False and RELAY is not None:
+                RELAY.drop_room(room.code)             # whoever is talking is cut off right away
+            for k, label in (("voice", "voice chat"), ("e2e", "end-to-end encryption")):
+                if k in changed:
+                    room.broadcast({"type": "INFO", "text": f"The host turned {label} {'ON' if changed[k] else 'off'} "
+                                                            "for this room"})
+    elif t in ("UNBAN", "ROOM_SET", "KICK", "SET_ROLE"):
+        client.send({"type": "ERROR", "text": "Only the host of the room can do that"})
     elif t == "VERSIONS_REQ":
         client.send({"type": "VERSIONS", "versions": room.versions_payload()})
     elif t == "VERSION_SAVE" and is_host:
@@ -874,9 +915,10 @@ def announce_backups():
 
 
 def voice_auth(room_code, user, token):
-    """Voice relay: only an online member of the room, proving it with its member token."""
+    """Voice relay: only an online member of the room, proving it with its member token - and only
+    while the host has voice chat switched on for the room."""
     r = rooms.get(str(room_code).upper())
-    if r is None or ROLE != "primary":
+    if r is None or ROLE != "primary" or not r.cfg["voice"]:
         return False
     m = r.members.get(user)
     return bool(m and m.client and token and hmac.compare_digest(str(token), m.token))
@@ -887,13 +929,16 @@ def voice_loss(room_code):
     return r.chaos["loss"] if r is not None and r.chaos else 0
 
 
-def make_invite(room):
-    """Invite link for browsers: a JWT that names the room, signed with the server secret. Whoever
-    holds it may join THAT room as a guest for one hour - no password travels over plain HTTP."""
+def make_invite(room, by):
+    """Invite link for browsers: a JWT that names the room AND the member who asked for it, signed with
+    the server secret. Whoever holds it may join THAT room as a guest for one hour - no password travels
+    over plain HTTP. Every link of one member counts against that member: at most INVITE_DEVICES of
+    their guests can be connected at the same time, however often the link or QR code is shared."""
     exp = int(time.time()) + 3600
-    tok = jwt_encode({"kind": "invite", "room": room.code, "exp": exp, "iss": "lan-whiteboard"}, jwt_secret)
+    tok = jwt_encode({"kind": "invite", "room": room.code, "by": by, "exp": exp, "iss": "lan-whiteboard"}, jwt_secret)
     url = f"http://{lan_ip()}:{WEB}/?room={room.code}&invite={tok}" if WEB else None
-    return {"url": url, "exp": exp, "room": room.code, "invite": tok}
+    return {"url": url, "exp": exp, "room": room.code, "invite": tok, "by": by, "max": INVITE_DEVICES,
+            "used": sorted(x.name for x in room.members.values() if x.via == by and x.client)}
 
 
 def guest_name(raw):
@@ -907,16 +952,18 @@ def join(client, msg):
         client.send({"type": "JOIN_ERR", "code": "STANDBY",
                      "text": "This server is a standby backup; it takes over only if the main server stops"})
         return False
-    guest = False
+    guest, inviter = False, None
     if msg.get("invite"):          # browser guest: the signed invite proves the right to enter one room
         try:
             claims = jwt_decode(str(msg["invite"]), jwt_secret)
             if claims.get("kind") != "invite" or msg["type"] != "JOIN_ROOM":
                 raise TokenError("not an invite")
+            if not claims.get("by"):
+                raise TokenError("made by an older server version: ask for a new link")
         except TokenError as e:
             client.send({"type": "JOIN_ERR", "code": "AUTH", "text": f"This invite link is not valid ({e})"})
             return False
-        guest, user = True, guest_name(msg.get("user"))
+        guest, user, inviter = True, guest_name(msg.get("user")), str(claims["by"])
         msg = dict(msg, room=claims["room"])
     elif AUTH:                     # identity comes from the verified token, never from the "user" field
         try:
@@ -950,6 +997,20 @@ def join(client, msg):
             client.send({"type": "JOIN_ERR", "code": "BANNED",
                          "text": "You were removed from this room by the host"})
             return False
+        if guest:
+            if inviter not in room.members:               # the member who shared the link was removed
+                client.send({"type": "JOIN_ERR", "code": "AUTH", "text": f"This invite link is no longer valid: "
+                             f"{inviter} is not a member of the room any more. Ask for a new link."})
+                return False
+            others = [x.name for x in room.members.values() if x.via == inviter and x.client and x.name != user]
+            if len(others) >= INVITE_DEVICES:
+                stats.add(rejected=1)
+                event(f"[room {room.code}] invite of {inviter}: device limit reached, {user} refused")
+                client.send({"type": "JOIN_ERR", "code": "INVITE_LIMIT",
+                             "text": f"{inviter}'s invite link is already used by {INVITE_DEVICES} devices "
+                                     f"({', '.join(others)}). Each person can connect at most {INVITE_DEVICES} "
+                                     "phones/browsers: close one of them, or ask someone else in the room for their link."})
+                return False
         m = room.members.get(user)
         proven = AUTH and not guest                       # the JWT already proved who this is
         if m and (proven or m.token == msg.get("token")):   # same identity -> (re)connect
@@ -967,6 +1028,8 @@ def join(client, msg):
                                             "editor")
             persist("save_member", room.code, m)
         was_online = m.client is not None
+        if guest:
+            m.via = inviter
         if m.token == msg.get("token") and msg.get("token"):
             stats.add(reconnects=1)
         m.client = client
@@ -976,10 +1039,11 @@ def join(client, msg):
         client.send({"type": "JOIN_OK", "room": room.code, "user": user, "token": m.token,
                      "role": m.role, "color": m.color, "host": room.host,
                      "snapshot": room.snapshot(), "chat": room.chat[-200:],
-                     "users": room.users_payload(), "chaos": room.chaos,
+                     "users": room.users_payload(), "banned": sorted(room.banned), "cfg": room.cfg,
+                     "chaos": room.chaos,
                      "backups": backups_payload(), "web": WEB, "voice": VOICE})
         event(f"[room {room.code}] {user} joined ({'browser' if client.kind == 'web' else 'desktop'}, {client.addr[0]})")
-        room.broadcast({"type": "USERS", "users": room.users_payload()}, skip=client)
+        room.broadcast(room.users_msg(), skip=client)
         if not was_online:
             room.broadcast({"type": "INFO", "text": f"{user} joined"}, skip=client)
     return True
@@ -1043,7 +1107,7 @@ def client_gone(client):
             m = room.members.get(client.user)
             if m and m.client is client:        # not already replaced by a reconnect
                 m.client = None
-                room.broadcast({"type": "USERS", "users": room.users_payload()})
+                room.broadcast(room.users_msg())
                 room.broadcast({"type": "INFO", "text": f"{client.user} left"})
                 event(f"[room {room.code}] {client.user} left")
     if client in replicas:
@@ -1124,7 +1188,7 @@ def repl_hello(client, msg):
         with r.lock:
             client.send({"type": "REPL_ROOM", "code": r.code, "password": r.password, "host": r.host,
                          "members": [[m.name, m.token, m.color, m.role, list(m.seen)] for m in r.members.values()],
-                         "banned": sorted(r.banned), "ops": r.log, "chat": r.chat, "versions": r.versions})
+                         "banned": sorted(r.banned), "cfg": r.cfg, "ops": r.log, "chat": r.chat, "versions": r.versions})
     client.send({"type": "REPL_READY", "rooms": len(rs)})
     client.ready = True
     event(f"[repl] standby {host}:{client.backup['port']} attached, {len(rs)} room(s) copied", flush=True)
@@ -1153,6 +1217,7 @@ def apply_repl(msg):
             mm = r.members[name] = Member(name, token, color, role)
             mm.seen.extend(seen)
         r.banned = set(msg["banned"])
+        r.cfg.update(msg.get("cfg") or {})
         for op in msg["ops"]:
             r.apply(op)
         r.chat, r.versions = msg["chat"], msg["versions"]
@@ -1165,6 +1230,7 @@ def apply_repl(msg):
                 store.save_member(r.code, mm)
             for b in r.banned:
                 store.ban(r.code, b)
+            store.set_cfg(r.code, r.cfg)
             for op in r.log:
                 store.add_op(r.code, op)
             for c in r.chat:
@@ -1204,6 +1270,10 @@ def apply_repl(msg):
             elif m == "ban":
                 r.banned.add(a[1])
                 r.members.pop(a[1], None)
+            elif m == "unban":
+                r.banned.discard(a[1])
+            elif m == "set_cfg":
+                r.cfg.update(a[1])
             elif m == "add_chat":
                 r.chat.append(a[1])
                 if len(a) > 2 and a[2] and a[1]["user"] in r.members:
@@ -1286,6 +1356,7 @@ def restore_rooms():
         for name, token, color, role in d["members"]:
             r.members[name] = Member(name, token, color, role)
         r.banned = set(d["banned"])
+        r.cfg.update({k: bool(v) for k, v in d.get("cfg", {}).items() if k in r.cfg})
         for op in d["ops"]:
             if op["seq"] != r.seq() + 1:          # never expected; stop rather than build a wrong board
                 event(f"[db] room {r.code}: op log has a gap at seq {op['seq']}, stopping replay there")
@@ -1455,7 +1526,7 @@ def main():
     ap.add_argument("--standby-of", default="", metavar="HOST[:PORT]",
                     help="run as a hot standby of that server and take over when it stops")
     a = ap.parse_args()
-    global store, AUTH, jwt_secret, tls_ctx, COMPRESS, ROLE, CLUSTER_KEY, WEB, TCP_PORT, ADMIN_KEY, VOICE
+    global store, AUTH, jwt_secret, tls_ctx, COMPRESS, ROLE, CLUSTER_KEY, WEB, TCP_PORT, ADMIN_KEY, VOICE, RELAY
     ADMIN_KEY = a.admin_key or secrets.token_urlsafe(6)
     AUTH = not a.no_auth
     COMPRESS, CLUSTER_KEY, TCP_PORT = not a.no_compress, a.cluster_key, a.port
@@ -1518,8 +1589,8 @@ def main():
                   "(or use 'Phone join' in the desktop client for a QR code)", flush=True)
     if not a.no_voice:
         try:
-            voice.Relay(a.host, a.voice_port, voice_auth, voice_loss,
-                        lambda k: stats.add(voice_pkts=1) if k == "relay" else stats.add(voice_drops=1))
+            RELAY = voice.Relay(a.host, a.voice_port, voice_auth, voice_loss,
+                                lambda k: stats.add(voice_pkts=1) if k == "relay" else stats.add(voice_drops=1))
             VOICE = a.voice_port
             print(f"Voice relay: UDP {a.voice_port}", flush=True)
         except OSError as e:

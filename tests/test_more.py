@@ -118,6 +118,7 @@ try:
     assert e2e.unseal(e2e.derive("wrong", room), sealed) is None
     assert e2e.unseal(keys, sealed[:20] + ("A" if sealed[20] != "A" else "B") + sealed[21:]) is None
     assert e2e.seal(keys, b"same") != e2e.seal(keys, b"same")              # fresh nonce every time
+    send_msg(a, {"type": "ROOM_SET", "e2e": True})      # only the host (alice) can switch E2E on for the room
     send_msg(a, {"type": "ADD", "msg_id": "e1", "obj": {"id": "enc1", "kind": "enc", "color": "#000000", "width": 1,
                                                          "points": [[0, 0]], "data": sealed}})
     send_msg(a, {"type": "CHAT", "msg_id": "e2", "text": e2e.PREFIX + e2e.seal(keys, b"meet at 5")}); drain(a)
@@ -141,6 +142,7 @@ try:
     order = [buf.pop() for _ in range(5)]
     assert order == [b"\n", b"\x0b", b"\x0c", None, b"\x0e"] and buf.lost == 1, (order, buf.lost)
     buf.push(11, 220, b"x", 500.0); assert buf.late == 1
+    send_msg(a, {"type": "ROOM_SET", "voice": True}); drain(a)    # only the host (alice) can switch voice on
     va = voice.VoiceClient("127.0.0.1", VP, room, "alice", ja["token"])
     vb = voice.VoiceClient("127.0.0.1", VP, room, "bob", jb["token"])
     vx = voice.VoiceClient("127.0.0.1", VP, room, "bob", "not-the-token")
